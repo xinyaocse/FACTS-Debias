@@ -65,7 +65,8 @@ class AdversarialClassifier(nn.Module):
 
 class Decoder(nn.Module):
     """
-    Use [z_shared, z_specific] to reconstruct x.
+    Reconstruct the input representation from the concatenation of
+    shared and specific latent representations.
     """
     def __init__(self, latent_dim=768, token_dim=768):
         super().__init__()
@@ -83,29 +84,32 @@ class Decoder(nn.Module):
 
 def orthogonality_loss(a, b):
     """
-    Encourage z_shared and z_specific to be orthogonal.
+    Encourage the shared and specific representations to be orthogonal.
     """
     return torch.mean(torch.abs(torch.sum(a * b, dim=-1)))
 
 
 def variance_loss(z):
     """
-    Prevent z_specific from collapsing.
+    Prevent representation collapse by encouraging non-zero variance.
     """
     if z.size(0) <= 1:
         return torch.zeros((), device=z.device)
+
     return -torch.var(z, dim=0, unbiased=False).mean()
 
 
 def class_specific_direction_loss(z_specific, y, num_classes=3, eps=1e-8):
     """
-    Encourage z_specific to form class-specific directions.
+    Encourage class-specific structure in the specific representation space.
 
+    The objective contains two parts:
     1. Intra-class compactness:
-       Samples from the same class should be close to their class mean.
+       representations from the same class are encouraged to be close
+       to their class mean.
 
     2. Inter-class separation:
-       Class mean directions should be separated.
+       normalized class mean directions are encouraged to be separated.
     """
     device = z_specific.device
 
@@ -195,7 +199,7 @@ def train_model(
             x = x.to(device)
             y = y.to(device)
 
-            # Step A: train adversarial classifier with detached z_shared
+            # Step A: update the adversarial classifier using detached z_shared.
             z_shared, z_specific = encoder(x)
 
             adv_logits_clf = adv_classifier(z_shared.detach())
@@ -211,7 +215,7 @@ def train_model(
 
             opt_adv.step()
 
-            # Step B: train encoder, classifier, and decoder
+            # Step B: update the encoder, task classifier, and decoder.
             z_shared, z_specific = encoder(x)
 
             logits = classifier(z_specific)

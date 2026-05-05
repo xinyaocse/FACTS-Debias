@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-Train a lightweight TextSpaceClassifier on flan-t5-small sentence embeddings.
+Train a lightweight TextSpaceClassifier on T5 encoder sentence embeddings.
 
-- 用 T5EncoderModel(mean-pool) 得到 512 维句向量
-- 默认模型路径：/root/public/lcx/GenderCARE-ccs24-main/Code/flan-t5-small
-- ✅ 支持 3-class 标签 (0/1/2)
-- 可选：--num_labels 3 强制标签空间为 {0,1,2}
+Main functions:
+- Encode input texts with a T5 encoder using mean pooling
+- Train a classifier in the embedding space
+- Support multi-class labels, e.g., labels in {0, 1, 2}
+- Save the trained classifier and label mapping
 """
 
 import os
@@ -28,7 +29,9 @@ from sklearn.utils.class_weight import compute_class_weight
 from transformers import AutoTokenizer, T5EncoderModel, AutoModel
 
 
-# ----------------- Utils -----------------
+# -----------------
+# Utilities
+# -----------------
 
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -40,6 +43,7 @@ def set_seed(seed: int = 42):
 def detect_columns(fieldnames: List[str]) -> Tuple[str, str]:
     text_keys = ["text", "sentence", "content", "texts", "input", "prompt"]
     label_keys = ["label", "y", "target", "class", "labels"]
+
     lower2orig = {c.lower(): c for c in fieldnames}
 
     def first(keys):
@@ -50,30 +54,42 @@ def detect_columns(fieldnames: List[str]) -> Tuple[str, str]:
 
     tcol = first(text_keys)
     ycol = first(label_keys)
+
     if tcol is None or ycol is None:
         raise ValueError(
-            f"CSV 未找到文本/标签列。字段有：{fieldnames}\n"
-            f"文本列候选：{text_keys}\n标签列候选：{label_keys}"
+            f"Cannot find text or label columns in the CSV file. "
+            f"Available columns: {fieldnames}\n"
+            f"Candidate text columns: {text_keys}\n"
+            f"Candidate label columns: {label_keys}"
         )
+
     return tcol, ycol
 
 
 def load_texts_and_labels(csv_path: str) -> Tuple[List[str], List[str]]:
     texts, labels = [], []
+
     with open(csv_path, "r", encoding="utf-8-sig") as f:
-        r = csv.DictReader(f)
-        if not r.fieldnames:
-            raise ValueError(f"{csv_path} 无表头或为空")
-        tcol, ycol = detect_columns(r.fieldnames)
-        for row in r:
-            t = (row.get(tcol, "") or "").strip()
-            y = (row.get(ycol, "") or "").strip()
-            if t == "":
+        reader = csv.DictReader(f)
+
+        if not reader.fieldnames:
+            raise ValueError(f"{csv_path} has no header or is empty.")
+
+        tcol, ycol = detect_columns(reader.fieldnames)
+
+        for row in reader:
+            text = (row.get(tcol, "") or "").strip()
+            label = (row.get(ycol, "") or "").strip()
+
+            if text == "":
                 continue
-            texts.append(t)
-            labels.append(y)
+
+            texts.append(text)
+            labels.append(label)
+
     if len(texts) == 0:
-        raise ValueError(f"{csv_path} 没有有效的数据行")
+        raise ValueError(f"{csv_path} contains no valid data rows.")
+
     return texts, labels
 
 
@@ -83,35 +99,46 @@ def build_label_mapping(
     enforce_numeric: bool = True,
 ) -> Tuple[Dict[str, int], List[int]]:
     """
-    - 如果 num_labels=3：强制标签空间为 {'0','1','2'}，并检查非法值
-    - 否则：沿用你原来的逻辑（若全数字则按 uniq 排序映射到 0..K-1；否则按字符串 uniq）
+    Build a label mapping.
+
+    If num_labels is provided and enforce_numeric=True, labels are expected
+    to be numeric strings in the range {0, ..., num_labels - 1}.
+
+    Otherwise, labels are automatically mapped to consecutive integer IDs.
     """
     raw_labels = [(y or "").strip() for y in raw_labels]
 
-    # ✅ 强制 3 类 (0/1/2)
     if num_labels is not None:
         if enforce_numeric:
             allowed = {str(i) for i in range(num_labels)}
             bad = sorted(list(set([y for y in raw_labels if y not in allowed])))
+
             if bad:
                 raise ValueError(
-                    f"发现不在 0..{num_labels-1} 范围内的标签：{bad[:20]} "
-                    f"(共 {len(bad)} 个不同非法标签). 请检查 CSV 的 label 列。"
+                    f"Found labels outside the range 0..{num_labels - 1}: {bad[:20]} "
+                    f"({len(bad)} unique invalid labels in total). "
+                    f"Please check the label column in the CSV file."
                 )
+
             mapping = {str(i): i for i in range(num_labels)}
             mapped = [mapping[y] for y in raw_labels]
+
             return mapping, mapped
 
-        # 不强制 numeric 的情况（一般你用不到）
-        uniq = sorted(list(set(raw_labels)))
-        if len(uniq) != num_labels:
-            raise ValueError(f"期望 {num_labels} 类，但数据中发现 {len(uniq)} 类: {uniq}")
-        mapping = {u: i for i, u in enumerate(uniq)}
+        unique_labels = sorted(list(set(raw_labels)))
+
+        if len(unique_labels) != num_labels:
+            raise ValueError(
+                f"Expected {num_labels} classes, but found {len(unique_labels)}: {unique_labels}"
+            )
+
+        mapping = {label: i for i, label in enumerate(unique_labels)}
         mapped = [mapping[y] for y in raw_labels]
+
         return mapping, mapped
 
-    # ===== 否则：保持你原来的“自动映射” =====
     all_numeric = True
+
     for y in raw_labels:
         try:
             _ = int(y)
@@ -120,14 +147,16 @@ def build_label_mapping(
             break
 
     if all_numeric:
-        uniq = sorted(list(set(int(y) for y in raw_labels)))
-        mapping = {str(v): i for i, v in enumerate(uniq)}
+        unique_labels = sorted(list(set(int(y) for y in raw_labels)))
+        mapping = {str(v): i for i, v in enumerate(unique_labels)}
         mapped = [mapping[str(int(y))] for y in raw_labels]
+
         return mapping, mapped
 
-    uniq = sorted(list(set(raw_labels)))
-    mapping = {u: i for i, u in enumerate(uniq)}
+    unique_labels = sorted(list(set(raw_labels)))
+    mapping = {label: i for i, label in enumerate(unique_labels)}
     mapped = [mapping[y] for y in raw_labels]
+
     return mapping, mapped
 
 
@@ -140,44 +169,91 @@ def t5_embed_texts(
     max_length: int = 128
 ) -> torch.Tensor:
     """
-    用 flan-t5-small 做 encoder-only embedding，输出 [B, 512]
+    Encode texts with a T5 encoder and return mean-pooled embeddings.
+
+    Args:
+        texts: Input text list.
+        t5_path: Local path to the T5 model.
+        device: Computation device.
+        batch_size: Batch size for encoding.
+        max_length: Maximum token length.
+
+    Returns:
+        A tensor of shape [B, H], where H is the encoder hidden size.
     """
-    tok = AutoTokenizer.from_pretrained(t5_path, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        t5_path,
+        local_files_only=True
+    )
 
     try:
-        enc = T5EncoderModel.from_pretrained(t5_path, local_files_only=True).to(device).eval()
+        encoder = T5EncoderModel.from_pretrained(
+            t5_path,
+            local_files_only=True
+        ).to(device).eval()
 
         def encode(batch_tok):
-            out = enc(input_ids=batch_tok["input_ids"], attention_mask=batch_tok["attention_mask"])
-            return out.last_hidden_state  # [B, L, 512]
+            output = encoder(
+                input_ids=batch_tok["input_ids"],
+                attention_mask=batch_tok["attention_mask"]
+            )
+            return output.last_hidden_state
 
     except Exception:
-        base = AutoModel.from_pretrained(t5_path, local_files_only=True).to(device).eval()
-        encoder_only = base.get_encoder() if hasattr(base, "get_encoder") else base
+        base_model = AutoModel.from_pretrained(
+            t5_path,
+            local_files_only=True
+        ).to(device).eval()
+
+        encoder_only = base_model.get_encoder() if hasattr(base_model, "get_encoder") else base_model
 
         def encode(batch_tok):
-            out = encoder_only(input_ids=batch_tok["input_ids"], attention_mask=batch_tok["attention_mask"])
-            if hasattr(out, "last_hidden_state"):
-                return out.last_hidden_state
-            elif isinstance(out, (list, tuple)) and len(out) > 0:
-                return out[0]
-            else:
-                raise RuntimeError("Encoder output missing last_hidden_state")
+            output = encoder_only(
+                input_ids=batch_tok["input_ids"],
+                attention_mask=batch_tok["attention_mask"]
+            )
 
-    outs = []
+            if hasattr(output, "last_hidden_state"):
+                return output.last_hidden_state
+
+            if isinstance(output, (list, tuple)) and len(output) > 0:
+                return output[0]
+
+            raise RuntimeError("Encoder output does not contain last_hidden_state.")
+
+    outputs = []
+
     for i in range(0, len(texts), batch_size):
         chunk = texts[i:i + batch_size]
-        toks = tok(chunk, padding=True, truncation=True, max_length=max_length, return_tensors="pt").to(device)
-        last = encode(toks)  # [B, L, 512]
-        mask = toks["attention_mask"].unsqueeze(-1)  # [B, L, 1]
-        mean = (last * mask).sum(1) / mask.sum(1).clamp(min=1)  # [B, 512]
-        outs.append(torch.nan_to_num(mean))
-    return torch.cat(outs, dim=0) if outs else torch.empty(0, 512, device=device)
+
+        tokens = tokenizer(
+            chunk,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt"
+        ).to(device)
+
+        last_hidden_state = encode(tokens)
+        attention_mask = tokens["attention_mask"].unsqueeze(-1)
+
+        mean_pooled = (
+            (last_hidden_state * attention_mask).sum(dim=1)
+            / attention_mask.sum(dim=1).clamp(min=1)
+        )
+
+        outputs.append(torch.nan_to_num(mean_pooled))
+
+    if outputs:
+        return torch.cat(outputs, dim=0)
+
+    return torch.empty(0, 512, device=device)
 
 
 class TextSpaceClassifier(nn.Module):
     def __init__(self, in_dim=512, hidden=256, num_labels=3, p_drop=0.1):
         super().__init__()
+
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.ReLU(),
@@ -189,71 +265,133 @@ class TextSpaceClassifier(nn.Module):
         return self.net(torch.nan_to_num(x))
 
 
-def make_loader(X: torch.Tensor, y: torch.Tensor, batch_size: int, shuffle: bool):
-    ds = torch.utils.data.TensorDataset(X, y)
-    return torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=False)
+def make_loader(
+    X: torch.Tensor,
+    y: torch.Tensor,
+    batch_size: int,
+    shuffle: bool
+):
+    dataset = torch.utils.data.TensorDataset(X, y)
+
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=False
+    )
 
 
-def train_one_epoch(model, loader, opt, device, class_weights=None):
+def train_one_epoch(model, loader, optimizer, device, class_weights=None):
     model.train()
-    total, correct, loss_sum = 0, 0, 0.0
-    for xb, yb in loader:
-        xb, yb = xb.to(device), yb.to(device)
-        logits = model(xb)
-        loss = F.cross_entropy(logits, yb, weight=class_weights) if class_weights is not None else F.cross_entropy(logits, yb)
 
-        opt.zero_grad(set_to_none=True)
+    total = 0
+    correct = 0
+    loss_sum = 0.0
+
+    for xb, yb in loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+
+        logits = model(xb)
+
+        if class_weights is not None:
+            loss = F.cross_entropy(logits, yb, weight=class_weights)
+        else:
+            loss = F.cross_entropy(logits, yb)
+
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=1.0
+        )
+
+        optimizer.step()
 
         loss_sum += float(loss.detach().cpu())
-        pred = logits.argmax(-1)
+
+        pred = logits.argmax(dim=-1)
         total += yb.numel()
         correct += (pred == yb).sum().item()
 
     acc = correct / max(1, total)
-    return loss_sum / max(1, len(loader)), acc
+    avg_loss = loss_sum / max(1, len(loader))
+
+    return avg_loss, acc
 
 
 @torch.no_grad()
 def eval_model(model, loader, device):
     model.eval()
-    total, correct, loss_sum = 0, 0, 0.0
+
+    total = 0
+    correct = 0
+    loss_sum = 0.0
+
     for xb, yb in loader:
-        xb, yb = xb.to(device), yb.to(device)
+        xb = xb.to(device)
+        yb = yb.to(device)
+
         logits = model(xb)
         loss = F.cross_entropy(logits, yb)
+
         loss_sum += float(loss.detach().cpu())
-        pred = logits.argmax(-1)
+
+        pred = logits.argmax(dim=-1)
         total += yb.numel()
         correct += (pred == yb).sum().item()
+
     acc = correct / max(1, total)
-    return loss_sum / max(1, len(loader)), acc
+    avg_loss = loss_sum / max(1, len(loader))
+
+    return avg_loss, acc
 
 
 def build_argparser():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--train_csv", type=str, default="train_dataset_sampled.csv")
-    ap.add_argument("--save_path", type=str, default="checkpoints/text_space_clf.pt")
+    parser = argparse.ArgumentParser(
+        description="Train a lightweight classifier on T5 encoder embeddings."
+    )
 
-    ap.add_argument("--t5_path", type=str, default="/root/public/lcx/GenderCARE-ccs24-main/Code/flan-t5-small")
+    parser.add_argument(
+        "--train_csv",
+        type=str,
+        default="train_dataset_sampled.csv"
+    )
 
-    ap.add_argument("--epochs", type=int, default=6)
-    ap.add_argument("--batch_size", type=int, default=256)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--val_ratio", type=float, default=0.1)
-    ap.add_argument("--use_class_weights", action="store_true")
-    ap.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--save_path",
+        type=str,
+        default="checkpoints/text_space_clf.pt"
+    )
 
-    # ✅ 新增：强制 3 类标签(0/1/2)。建议你训练三类时总是显式传这个。
-    ap.add_argument("--num_labels", type=int, default=3)
+    parser.add_argument(
+        "--t5_path",
+        type=str,
+        default=os.environ.get("T5_MODEL_PATH", "models/flan-t5-small"),
+        help="Local path to the T5 model."
+    )
 
-    return ap
+    parser.add_argument("--epochs", type=int, default=6)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--val_ratio", type=float, default=0.1)
+    parser.add_argument("--use_class_weights", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument(
+        "--num_labels",
+        type=int,
+        default=3,
+        help="Number of labels. By default, labels are expected to be 0, 1, and 2."
+    )
+
+    return parser
 
 
 def main():
     args = build_argparser().parse_args()
+
     set_seed(args.seed)
 
     os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
@@ -261,76 +399,157 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device={device}, t5_path={args.t5_path}")
 
-    # 1) load data
+    # 1. Load data.
     texts, raw_labels = load_texts_and_labels(args.train_csv)
     print(f"Loaded {len(texts)} rows from {args.train_csv}")
 
-    # 2) label mapping (✅ enforce 0/1/2 by default)
-    label_map, y_list = build_label_mapping(raw_labels, num_labels=args.num_labels, enforce_numeric=True)
+    # 2. Build label mapping.
+    label_map, y_list = build_label_mapping(
+        raw_labels,
+        num_labels=args.num_labels,
+        enforce_numeric=True
+    )
+
     num_labels = args.num_labels
     y = torch.tensor(y_list, dtype=torch.long)
 
-    # save label map
+    # 3. Save label mapping.
     base, _ = os.path.splitext(args.save_path)
+
     with open(base + "_label_map.json", "w", encoding="utf-8") as f:
         json.dump(label_map, f, ensure_ascii=False, indent=2)
 
-    # quick stats
-    binc = np.bincount(np.asarray(y_list, dtype=np.int64), minlength=num_labels)
-    print("[i] label counts:", {i: int(binc[i]) for i in range(num_labels)})
+    label_counts = np.bincount(
+        np.asarray(y_list, dtype=np.int64),
+        minlength=num_labels
+    )
 
-    # 3) embeddings
-    X = t5_embed_texts(texts, t5_path=args.t5_path, device=device, batch_size=128, max_length=128)
-    assert X.shape[0] == y.shape[0] and X.shape[1] == 512, f"Emb shape mismatch: {X.shape}"
+    print(
+        "Label counts:",
+        {i: int(label_counts[i]) for i in range(num_labels)}
+    )
 
-    # 4) split train/val
+    # 4. Encode texts into embeddings.
+    X = t5_embed_texts(
+        texts,
+        t5_path=args.t5_path,
+        device=device,
+        batch_size=128,
+        max_length=128
+    )
+
+    assert X.shape[0] == y.shape[0] and X.shape[1] == 512, (
+        f"Embedding shape mismatch: {X.shape}"
+    )
+
+    # 5. Split train and validation sets.
     N = X.shape[0]
-    idx = np.arange(N)
-    np.random.shuffle(idx)
+    indices = np.arange(N)
+    np.random.shuffle(indices)
+
     val_n = int(N * args.val_ratio)
-    val_idx = idx[:val_n]
-    tr_idx = idx[val_n:]
+    val_idx = indices[:val_n]
+    train_idx = indices[val_n:]
 
-    X_tr, y_tr = X[tr_idx], y[tr_idx]
-    X_val, y_val = X[val_idx], y[val_idx]
+    X_train = X[train_idx]
+    y_train = y[train_idx]
 
-    # 5) class weights (optional, ✅ aligned to 0..num_labels-1, and safe for missing class)
+    X_val = X[val_idx]
+    y_val = y[val_idx]
+
+    # 6. Build class weights if required.
     class_weights = None
+
     if args.use_class_weights:
-        y_np = y_tr.detach().cpu().numpy()
+        y_np = y_train.detach().cpu().numpy()
         present = np.unique(y_np)
 
         weights = np.ones((num_labels,), dtype=np.float32)
-        # only compute for present classes (avoid sklearn error if a class is missing)
-        w_present = compute_class_weight(class_weight="balanced", classes=present, y=y_np)
+
+        w_present = compute_class_weight(
+            class_weight="balanced",
+            classes=present,
+            y=y_np
+        )
+
         for c, w in zip(present, w_present):
             weights[int(c)] = float(w)
 
-        class_weights = torch.tensor(weights, dtype=torch.float, device=device)
-        print("[i] class weights:", class_weights.detach().cpu().numpy().tolist())
+        class_weights = torch.tensor(
+            weights,
+            dtype=torch.float,
+            device=device
+        )
 
-    # 6) model/opt
-    model = TextSpaceClassifier(in_dim=512, hidden=256, num_labels=num_labels, p_drop=0.1).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        print("Class weights:", class_weights.detach().cpu().numpy().tolist())
 
-    # 7) loaders
-    train_loader = make_loader(X_tr, y_tr, batch_size=args.batch_size, shuffle=True)
-    val_loader = make_loader(X_val, y_val, batch_size=args.batch_size, shuffle=False)
+    # 7. Build model and optimizer.
+    model = TextSpaceClassifier(
+        in_dim=512,
+        hidden=256,
+        num_labels=num_labels,
+        p_drop=0.1
+    ).to(device)
 
-    # 8) train
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr
+    )
+
+    # 8. Build data loaders.
+    train_loader = make_loader(
+        X_train,
+        y_train,
+        batch_size=args.batch_size,
+        shuffle=True
+    )
+
+    val_loader = make_loader(
+        X_val,
+        y_val,
+        batch_size=args.batch_size,
+        shuffle=False
+    )
+
+    # 9. Train classifier.
     best_val_acc = 0.0
     best_state = None
-    for ep in range(1, args.epochs + 1):
-        tr_loss, tr_acc = train_one_epoch(model, train_loader, opt, device, class_weights=class_weights)
-        val_loss, val_acc = eval_model(model, val_loader, device)
-        print(f"[ep{ep:02d}] train loss={tr_loss:.4f} acc={tr_acc:.4f} | val loss={val_loss:.4f} acc={val_acc:.4f}")
+
+    for epoch in range(1, args.epochs + 1):
+        train_loss, train_acc = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            class_weights=class_weights
+        )
+
+        val_loss, val_acc = eval_model(
+            model,
+            val_loader,
+            device
+        )
+
+        print(
+            f"[Epoch {epoch:02d}] "
+            f"train loss={train_loss:.4f}, acc={train_acc:.4f} | "
+            f"val loss={val_loss:.4f}, acc={val_acc:.4f}"
+        )
+
         if val_acc >= best_val_acc:
             best_val_acc = val_acc
-            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            best_state = {
+                k: v.detach().cpu()
+                for k, v in model.state_dict().items()
+            }
 
-    # 9) save
+    # 10. Save classifier.
     payload = {
-        "state_dict": best_state if best_state is not None else {k: v.detach().cpu() for k, v in model.state_dict().items()},
+        "state_dict": (
+            best_state
+            if best_state is not None
+            else {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        ),
         "num_labels": num_labels,
         "label_map": label_map,
         "t5_path": args.t5_path,
@@ -340,11 +559,17 @@ def main():
             "p_drop": 0.1,
         },
     }
+
     torch.save(payload, args.save_path)
-    print(f"Saved classifier to {args.save_path} (best val acc={best_val_acc:.4f})")
+
+    print(
+        f"Saved classifier to {args.save_path} "
+        f"(best val acc={best_val_acc:.4f})"
+    )
 
 
 if __name__ == "__main__":
     os.environ["HF_HUB_OFFLINE"] = os.environ.get("HF_HUB_OFFLINE", "1")
     os.environ["TRANSFORMERS_OFFLINE"] = os.environ.get("TRANSFORMERS_OFFLINE", "1")
+
     main()

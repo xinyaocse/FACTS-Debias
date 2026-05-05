@@ -2,23 +2,26 @@
 # -*- coding: utf-8 -*-
 
 """
-- Train representation decomposition model
-- Extract z_specific and z_shared
+Train a representation decomposition model.
+
+Main functions:
+- Train the encoder, classifier, adversarial classifier, and decoder
+- Extract z_specific and z_shared representations
 - Save model checkpoints and vector outputs
 - Evaluate:
   (1) z_specific -> label accuracy
-  (2) z_shared -> label accuracy using adversarial head
+  (2) z_shared -> label accuracy using the adversarial head
 """
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import sys
-sys.path.append("/root/bias")
+import argparse
+import random
 
 import torch
 import numpy as np
-import random
 from torch.utils.data import DataLoader
 
 from model import Encoder, Classifier, AdversarialClassifier, Decoder, train_model
@@ -79,7 +82,7 @@ def evaluate_model(encoder, classifier, dataloader, device, name=""):
         all_labels.extend(y.cpu().tolist())
 
     acc = accuracy_score(all_labels, all_preds)
-    print(f"z_specific 分类准确率 ({name}): {acc * 100:.2f}%")
+    print(f"z_specific classification accuracy ({name}): {acc * 100:.2f}%")
 
     return acc
 
@@ -104,7 +107,7 @@ def evaluate_z_shared_adversarial(encoder, adv_classifier, dataloader, device, n
         all_labels.extend(y.cpu().tolist())
 
     acc = accuracy_score(all_labels, all_preds)
-    print(f"z_shared 分类准确率 (adv head, {name}): {acc * 100:.2f}%")
+    print(f"z_shared classification accuracy (adv head, {name}): {acc * 100:.2f}%")
 
     return acc
 
@@ -121,8 +124,8 @@ def set_seed(seed=42):
 
 def compute_aligned_class_weights(train_labels, num_classes, device):
     """
-    Return length=num_classes weights aligned to class index 0..num_classes-1.
-    If some class is missing, use weight=1.0 for that class.
+    Return class weights aligned to class indices 0, 1, ..., num_classes - 1.
+    If a class is missing in the training set, its weight is set to 1.0.
     """
     labels = np.asarray(train_labels, dtype=np.int64)
     present = np.unique(labels)
@@ -145,7 +148,9 @@ def compute_aligned_class_weights(train_labels, num_classes, device):
 
 def save_per_class_z_and_dirs(z_specific, labels, out_dir, num_classes=3, eps=1e-8):
     """
-    Save:
+    Save per-class z_specific representations and normalized class directions.
+
+    Saved files:
       - z_specific_train_class{c}.pt
       - dir_specific_class{c}.pt
     """
@@ -162,7 +167,7 @@ def save_per_class_z_and_dirs(z_specific, labels, out_dir, num_classes=3, eps=1e
         print(f"Saved {z_path}, shape={tuple(z_c.shape)}")
 
         if z_c.numel() == 0:
-            print(f"class {c} missing in train set, skip dir_specific_class{c}.pt")
+            print(f"Class {c} is missing in the training set. Skip dir_specific_class{c}.pt")
             continue
 
         mu = z_c.mean(dim=0)
@@ -173,26 +178,96 @@ def save_per_class_z_and_dirs(z_specific, labels, out_dir, num_classes=3, eps=1e
         print(f"Saved {dir_path}, shape={tuple(mu.shape)}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train a representation decomposition model."
+    )
+
+    parser.add_argument(
+        "--project_root",
+        type=str,
+        default=os.environ.get("PROJECT_ROOT", ""),
+        help="Optional project root added to sys.path. Leave empty if modules are in the current directory."
+    )
+
+    parser.add_argument(
+        "--embedding_model_path",
+        type=str,
+        default=os.environ.get("EMBEDDING_MODEL_PATH", "models/flan-t5-small"),
+        help="Path to the local embedding model."
+    )
+
+    parser.add_argument(
+        "--train_file",
+        type=str,
+        default="train_dataset_sampled.csv",
+        help="Path to the training CSV file."
+    )
+
+    parser.add_argument(
+        "--test_file",
+        type=str,
+        default="test_dataset_sampled.csv",
+        help="Path to the test CSV file."
+    )
+
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default="checkpoints",
+        help="Directory for saving model checkpoints."
+    )
+
+    parser.add_argument(
+        "--vector_dir",
+        type=str,
+        default=os.path.join("outputs", "vectors"),
+        help="Directory for saving extracted vectors."
+    )
+
+    parser.add_argument("--num_classes", type=int, default=3)
+    parser.add_argument("--token_dim", type=int, default=512)
+    parser.add_argument("--latent_dim", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=12)
+    parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument("--lr_main", type=float, default=1e-4)
+    parser.add_argument("--lr_adv", type=float, default=3e-4)
+
+    parser.add_argument("--adv_alpha", type=float, default=1.0)
+    parser.add_argument("--recon_alpha", type=float, default=0.2)
+    parser.add_argument("--proto_intra_alpha", type=float, default=0.05)
+    parser.add_argument("--proto_inter_alpha", type=float, default=0.10)
+    parser.add_argument("--proto_warmup_epochs", type=int, default=3)
+
+    return parser.parse_args()
+
+
 # ==============================
 # Main
 # ==============================
 
 def main():
-    set_seed()
+    args = parse_args()
+
+    if args.project_root:
+        sys.path.append(args.project_root)
+
+    set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    t5_model_path = "/root/public/lcx/GenderCARE-ccs24-main/Code/flan-t5-small"
-
-    num_classes = 3
+    print(f"Using device: {device}")
 
     # ==============================
     # Train data
     # ==============================
 
-    train_texts, train_labels = load_data("train_dataset_sampled.csv")
+    train_texts, train_labels = load_data(args.train_file)
+
     train_embeddings = get_gtr_token_embeddings(
         train_texts,
-        t5_model_path,
+        args.embedding_model_path,
         device=device
     )
 
@@ -200,21 +275,21 @@ def main():
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=4,
+        batch_size=args.batch_size,
         shuffle=True,
         drop_last=True
     )
 
     train_loader_for_extract = DataLoader(
         train_dataset,
-        batch_size=4,
+        batch_size=args.batch_size,
         shuffle=False,
         drop_last=False
     )
 
     class_weights = compute_aligned_class_weights(
         train_labels,
-        num_classes=num_classes,
+        num_classes=args.num_classes,
         device=device
     )
 
@@ -224,21 +299,36 @@ def main():
     # Model
     # ==============================
 
-    encoder = Encoder(token_dim=512, latent_dim=512).to(device)
-    classifier = Classifier(latent_dim=512, num_classes=num_classes).to(device)
-    adv_classifier = AdversarialClassifier(latent_dim=512, num_classes=num_classes).to(device)
-    decoder = Decoder(latent_dim=512, token_dim=512).to(device)
+    encoder = Encoder(
+        token_dim=args.token_dim,
+        latent_dim=args.latent_dim
+    ).to(device)
+
+    classifier = Classifier(
+        latent_dim=args.latent_dim,
+        num_classes=args.num_classes
+    ).to(device)
+
+    adv_classifier = AdversarialClassifier(
+        latent_dim=args.latent_dim,
+        num_classes=args.num_classes
+    ).to(device)
+
+    decoder = Decoder(
+        latent_dim=args.latent_dim,
+        token_dim=args.token_dim
+    ).to(device)
 
     opt_main = torch.optim.Adam(
         list(encoder.parameters()) +
         list(classifier.parameters()) +
         list(decoder.parameters()),
-        lr=1e-4
+        lr=args.lr_main
     )
 
     opt_adv = torch.optim.Adam(
         list(adv_classifier.parameters()),
-        lr=3e-4
+        lr=args.lr_adv
     )
 
     # ==============================
@@ -255,13 +345,13 @@ def main():
         opt_adv=opt_adv,
         device=device,
         class_weights=class_weights,
-        num_classes=num_classes,
-        adv_alpha=1.0,
-        recon_alpha=0.2,
-        proto_intra_alpha=0.05,
-        proto_inter_alpha=0.10,
-        proto_warmup_epochs=3,
-        epochs=12
+        num_classes=args.num_classes,
+        adv_alpha=args.adv_alpha,
+        recon_alpha=args.recon_alpha,
+        proto_intra_alpha=args.proto_intra_alpha,
+        proto_inter_alpha=args.proto_inter_alpha,
+        proto_warmup_epochs=args.proto_warmup_epochs,
+        epochs=args.epochs
     )
 
     evaluate_model(
@@ -276,22 +366,23 @@ def main():
     # Save checkpoints
     # ==============================
 
-    os.makedirs("checkpoints", exist_ok=True)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
 
-    torch.save(encoder.state_dict(), "checkpoints/encoder.pt")
-    torch.save(classifier.state_dict(), "checkpoints/classifier.pt")
-    torch.save(adv_classifier.state_dict(), "checkpoints/adv_classifier.pt")
+    torch.save(encoder.state_dict(), os.path.join(args.checkpoint_dir, "encoder.pt"))
+    torch.save(classifier.state_dict(), os.path.join(args.checkpoint_dir, "classifier.pt"))
+    torch.save(adv_classifier.state_dict(), os.path.join(args.checkpoint_dir, "adv_classifier.pt"))
 
-    print("Model weights saved to checkpoints/")
+    print(f"Model weights saved to {args.checkpoint_dir}/")
 
     # ==============================
     # Test data
     # ==============================
 
-    test_texts, test_labels = load_data("test_dataset_sampled.csv")
+    test_texts, test_labels = load_data(args.test_file)
+
     test_embeddings = get_gtr_token_embeddings(
         test_texts,
-        t5_model_path,
+        args.embedding_model_path,
         device=device
     )
 
@@ -299,7 +390,7 @@ def main():
 
     test_loader = DataLoader(
         test_dataset,
-        batch_size=4,
+        batch_size=args.batch_size,
         shuffle=False,
         drop_last=False
     )
@@ -316,7 +407,7 @@ def main():
     # Extract and save test vectors
     # ==============================
 
-    os.makedirs("outputs/vectors", exist_ok=True)
+    os.makedirs(args.vector_dir, exist_ok=True)
 
     z_specific_test = extract_z_specific(
         encoder,
@@ -330,8 +421,8 @@ def main():
         device
     )
 
-    torch.save(z_specific_test, "outputs/vectors/z_specific_test.pt")
-    torch.save(z_shared_test, "outputs/vectors/z_shared_test.pt")
+    torch.save(z_specific_test, os.path.join(args.vector_dir, "z_specific_test.pt"))
+    torch.save(z_shared_test, os.path.join(args.vector_dir, "z_shared_test.pt"))
 
     print("Saved z_specific_test.pt and z_shared_test.pt")
 
@@ -351,8 +442,8 @@ def main():
         device
     )
 
-    torch.save(z_specific_train, "outputs/vectors/z_specific_train.pt")
-    torch.save(z_shared_train, "outputs/vectors/z_shared_train.pt")
+    torch.save(z_specific_train, os.path.join(args.vector_dir, "z_specific_train.pt"))
+    torch.save(z_shared_train, os.path.join(args.vector_dir, "z_shared_train.pt"))
 
     print("Saved z_specific_train.pt and z_shared_train.pt")
 
@@ -363,8 +454,8 @@ def main():
     save_per_class_z_and_dirs(
         z_specific=z_specific_train,
         labels=train_labels,
-        out_dir="outputs/vectors",
-        num_classes=num_classes
+        out_dir=args.vector_dir,
+        num_classes=args.num_classes
     )
 
     # ==============================
@@ -372,7 +463,7 @@ def main():
     # ==============================
 
     print("=" * 60)
-    print("adv head evaluation: z_shared to label, lower is better")
+    print("Adversarial head evaluation: z_shared -> label. Lower is better.")
 
     evaluate_z_shared_adversarial(
         encoder,
