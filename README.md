@@ -1,5 +1,5 @@
 # **FACTS-Debias**
-Fact-Anchored Anti-Bias Supervision for Fact-Preserving LLM Debiasing
+Purify Before You Debias: Fact-Anchored Supervision for Fact-Preserving LLM Debiasing
 
 ## Environmental Setup
 
