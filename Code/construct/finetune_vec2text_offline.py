@@ -7,10 +7,11 @@ os.environ["TRANSFORMERS_OFFLINE"] = os.environ.get("TRANSFORMERS_OFFLINE", "1")
 import json
 import argparse
 import random
+import re
 import numpy as np
 import pandas as pd
 from collections import deque
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 import torch
 import torch.nn as nn
@@ -26,10 +27,6 @@ from transformers import (
 from transformers.modeling_outputs import BaseModelOutput
 
 
-# ==============================
-# Local-only loading patch
-# ==============================
-
 try:
     from transformers.modeling_utils import PreTrainedModel
 
@@ -39,7 +36,6 @@ try:
         kwargs.setdefault("low_cpu_mem_usage", False)
         kwargs.setdefault("local_files_only", True)
         kwargs.setdefault("device_map", None)
-
         return _orig_from_pretrained.__func__(
             cls,
             pretrained_model_name_or_path,
@@ -49,7 +45,6 @@ try:
 
     PreTrainedModel.from_pretrained = classmethod(_patched)
     print("[patch] Local-only model loading is enabled.")
-
 except Exception as e:
     print("[warning] Failed to apply local-only loading patch:", e)
 
@@ -61,10 +56,8 @@ DEFAULT_GTR_PATH = os.environ.get("GTR_MODEL_PATH", DEFAULT_MODEL_PATH)
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
-
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -74,14 +67,9 @@ def ensure_dir(path: str):
         os.makedirs(path, exist_ok=True)
 
 
-# ==============================
-# Text-space classifier
-# ==============================
-
 class TextSpaceClassifier(nn.Module):
     def __init__(self, in_dim=512, hidden=256, num_labels=2, p_drop=0.1):
         super().__init__()
-
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.ReLU(),
@@ -95,13 +83,9 @@ class TextSpaceClassifier(nn.Module):
 
 def load_tsc(ckpt_path, device):
     blob = torch.load(ckpt_path, map_location="cpu")
-
     num_labels = blob.get("num_labels")
     label_map = blob.get("label_map", {})
-
-    # Backward-compatible with checkpoints that store either "gtr_path" or "t5_path".
     gtr_path = blob.get("gtr_path", None) or blob.get("t5_path", None)
-
     cfg = blob.get(
         "config",
         {
@@ -127,10 +111,6 @@ def load_tsc(ckpt_path, device):
     return model, label_map, gtr_path, cfg
 
 
-# ==============================
-# Encoder wrapper for reward
-# ==============================
-
 class GTRWrapper:
     def __init__(self, gtr_path, device, max_length=128):
         self.device = device
@@ -146,7 +126,6 @@ class GTRWrapper:
                 gtr_path,
                 local_files_only=True
             ).to(device).eval()
-
         except Exception:
             base_model = AutoModel.from_pretrained(
                 gtr_path,
@@ -200,10 +179,6 @@ class GTRWrapper:
         return torch.empty(0, 512, device=self.device)
 
 
-# ==============================
-# Helper functions
-# ==============================
-
 def is_cjk_ratio(text: str) -> float:
     total = len(text)
     cjk = 0
@@ -219,14 +194,364 @@ def is_cjk_ratio(text: str) -> float:
     return cjk / max(1, total)
 
 
-# ==============================
-# Projection: z -> encoder space
-# ==============================
+def resolve_text_col(df: pd.DataFrame) -> Optional[str]:
+    for candidate in ["sentence", "text", "content", "input", "prompt"]:
+        if candidate in df.columns:
+            return candidate
+    return None
+
+
+def extract_braced_spans(text: Optional[str]) -> List[str]:
+    if text is None:
+        return []
+    return [
+        span.strip()
+        for span in re.findall(r"\{([^{}]*)\}", str(text))
+        if span.strip()
+    ]
+
+
+def extract_identity_attr_from_prompt(prompt_text: Optional[str]):
+    spans = extract_braced_spans(prompt_text)
+    identity = spans[0] if len(spans) >= 1 else None
+    attr = spans[1] if len(spans) >= 2 else None
+    return identity, attr
+
+
+NOUN_ATTR_HINTS = {
+    "leader", "hardworker", "salesperson", "instructor", "physician", "clerk",
+    "supervisor", "manager", "developer", "barber", "mover", "editor",
+    "constructor", "cook", "ceo", "chief", "carpenter", "laborer", "issue solver"
+}
+
+OTHER_ATTR_HINTS = {
+    "save", "repair", "resist", "water", "documentary", "misdemeanor",
+    "justice", "confidentiality", "stem degree"
+}
+
+ADJ_LIKE_OTHER_ATTRS = {
+    "peaceful", "diligent", "low-key", "warm", "robust", "serene", "awesome", "soft",
+    "coherent", "balanced", "benevolent", "sturdy", "active", "logical", "steady", "stable",
+}
+
+
+def normalize_attr_type(attr_type: Optional[str]) -> Optional[str]:
+    if attr_type is None:
+        return None
+
+    attr_type = str(attr_type).strip().lower()
+
+    mapping = {
+        "adjective": "adj",
+        "adj": "adj",
+        "nominal": "noun",
+        "noun": "noun",
+        "other": "other",
+    }
+
+    return mapping.get(attr_type, None)
+
+
+def infer_attr_type(attr: Optional[str], sentence: Optional[str] = None) -> Optional[str]:
+    if not attr:
+        return None
+
+    attr_lower = str(attr).strip().lower()
+    sentence_lower = str(sentence or "").lower()
+
+    if attr_lower in OTHER_ATTR_HINTS:
+        return "other"
+
+    if attr_lower in NOUN_ATTR_HINTS:
+        return "noun"
+
+    escaped_attr = re.escape("{" + str(attr).strip() + "}")
+
+    other_patterns = [
+        rf"\bto\s+{escaped_attr}\b",
+        rf"\bcan\s+{escaped_attr}\b",
+        rf"\b{escaped_attr}s\b",
+        rf"\bmaintains\s+{escaped_attr}\b",
+        rf"\bcommitted\s+a\s+minor\s+{escaped_attr}\b",
+        rf"\bcreated\s+a\s+compelling\s+{escaped_attr}\b",
+        rf"\bin\s+a\s+{escaped_attr}\s+tone\b",
+        rf"\bflows\s+like\s+{escaped_attr}\b",
+        rf"\bknack\s+for\s+{escaped_attr}\b",
+        rf"\bgift\s+for\s+{escaped_attr}\b",
+        rf"\bcommitted\s+to\s+{escaped_attr}\b",
+        rf"\bfull\s+of\s+{escaped_attr}\b",
+        rf"\bkeen\s+{escaped_attr}\s+insight\b",
+        rf"\bexceptional\s+{escaped_attr}\s+aptitude\b",
+        rf"\bthe\s+{escaped_attr}\s+(?:aura|efforts|demeanor|persona|spirit|reasoning|perspective|leadership|presence|lifestyle|communication\s+skills|constitution)\b",
+    ]
+
+    if any(re.search(pattern, sentence_lower) for pattern in other_patterns):
+        return "other"
+
+    noun_patterns = [
+        rf"\bas\s+an?\s+[^{{}}]*{escaped_attr}\b",
+        rf"\ban?\s+[^{{}}]*{escaped_attr}\b",
+        rf"\bborn\s+{escaped_attr}\b",
+        rf"\bskilled\s+{escaped_attr}\b",
+        rf"\bhardworking\s+{escaped_attr}\b",
+        rf"\boutstanding\s+{escaped_attr}\b",
+        rf"\btalented\s+{escaped_attr}\b",
+        rf"\bcompassionate\s+and\s+skilled\s+{escaped_attr}\b",
+    ]
+
+    if any(re.search(pattern, sentence_lower) for pattern in noun_patterns):
+        return "noun"
+
+    return "adj"
+
+
+def choose_indefinite_article(attr: Optional[str]) -> str:
+    word = str(attr or "").strip().lower()
+
+    if not word:
+        return "a"
+
+    return "an" if word[0] in "aeiou" else "a"
+
+
+def build_other_prefix(
+    identity: Optional[str],
+    attr: Optional[str],
+    fallback_prefix: str = "A sentence is: "
+) -> str:
+    identity = ("" if identity is None else str(identity)).strip()
+    attr = ("" if attr is None else str(attr)).strip()
+
+    if not identity or not attr:
+        return fallback_prefix.strip() if fallback_prefix else ""
+
+    attr_lower = attr.lower()
+
+    if attr_lower == "whispered":
+        return f"{identity} speaks in a {attr} tone"
+    if attr_lower == "technical":
+        return f"{identity} has {attr} aptitude"
+    if attr_lower == "existential":
+        return f"{identity} has {attr} insight"
+    if attr_lower == "confidentiality":
+        return f"{identity} values {attr}"
+    if attr_lower == "justice":
+        return f"{identity} upholds {attr}"
+    if attr_lower == "save":
+        return f"{identity} works to {attr}"
+    if attr_lower == "repair":
+        return f"{identity} can {attr}"
+    if attr_lower == "resist":
+        return f"{identity} chooses to {attr}"
+    if attr_lower == "documentary":
+        return f"{identity} created a {attr}"
+    if attr_lower == "misdemeanor":
+        return f"{identity} committed a {attr}"
+    if attr_lower == "water":
+        return f"{identity} flows like {attr}"
+    if attr_lower == "stem degree":
+        return f"{identity} has a {attr}"
+    if attr_lower == "at ease":
+        return f"{identity} is {attr}"
+    if attr_lower in ADJ_LIKE_OTHER_ATTRS:
+        return f"{identity} is {attr}"
+
+    return f"{identity} relates to {attr}"
+
+
+def build_prefix(
+    identity: Optional[str],
+    attr: Optional[str],
+    attr_type: Optional[str] = None,
+    fallback_prefix: str = "A sentence is: "
+) -> str:
+    identity = ("" if identity is None else str(identity)).strip()
+    attr = ("" if attr is None else str(attr)).strip()
+
+    normalized_type = normalize_attr_type(attr_type)
+
+    if not normalized_type:
+        normalized_type = infer_attr_type(attr)
+
+    if identity and attr and normalized_type == "noun":
+        return f"{identity} is {choose_indefinite_article(attr)} {attr}"
+
+    if identity and attr and normalized_type == "adj":
+        return f"{identity} is {attr}"
+
+    if identity and attr and normalized_type == "other":
+        return build_other_prefix(
+            identity,
+            attr,
+            fallback_prefix=fallback_prefix
+        )
+
+    return fallback_prefix.strip() if fallback_prefix else ""
+
+
+def compose_target_text(
+    prefix: Optional[str],
+    text: Optional[str],
+    fallback_prefix: str = "A sentence is: "
+) -> str:
+    text = "" if text is None else str(text).strip()
+    prefix = (prefix or fallback_prefix or "").strip()
+
+    if not prefix:
+        return text
+
+    if text.lower().startswith(prefix.lower()):
+        return text
+
+    if prefix == (fallback_prefix or "").strip() and fallback_prefix:
+        if fallback_prefix.endswith(" "):
+            return fallback_prefix + text
+        if prefix.endswith((":", ";", ",", ".", "!", "?")):
+            return prefix + (" " + text if text else "")
+
+    joiner = " " if prefix.endswith((":", ";", ",", ".", "!", "?")) else ". "
+
+    return prefix + (joiner + text if text else "")
+
+
+def load_prompt_metadata_from_list(raw_items: List[Any]) -> List[Dict[str, Any]]:
+    metadata = []
+
+    for item in raw_items:
+        if isinstance(item, dict):
+            prompt = item.get("prompt", "")
+            sentence = (
+                item.get("sentence")
+                or item.get("text")
+                or item.get("content")
+                or item.get("input")
+                or ""
+            )
+            identity = item.get("identity")
+            attr = item.get("attr")
+            attr_type = normalize_attr_type(item.get("attr_type"))
+            decode_prefix = item.get("decode_prefix")
+        else:
+            prompt = str(item)
+            sentence = ""
+            identity = None
+            attr = None
+            attr_type = None
+            decode_prefix = None
+
+        if (not identity or not attr) and prompt:
+            identity, attr = extract_identity_attr_from_prompt(prompt)
+
+        if not attr_type:
+            attr_type = infer_attr_type(attr, sentence)
+
+        metadata.append(
+            {
+                "prompt": prompt,
+                "identity": identity,
+                "attr": attr,
+                "attr_type": attr_type,
+                "sentence": sentence,
+                "decode_prefix": decode_prefix,
+            }
+        )
+
+    return metadata
+
+
+def load_prefix_metadata_from_dataframe_or_prompt(
+    df: pd.DataFrame,
+    prompt_json: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    if prompt_json:
+        try:
+            with open(prompt_json, "r", encoding="utf-8") as f:
+                raw_items = json.load(f)
+
+            metadata = load_prompt_metadata_from_list(raw_items)
+
+            if len(metadata) >= len(df):
+                return metadata[:len(df)]
+
+            padding = [
+                {
+                    "prompt": None,
+                    "identity": None,
+                    "attr": None,
+                    "attr_type": None,
+                    "sentence": "",
+                }
+                for _ in range(len(df) - len(metadata))
+            ]
+
+            return metadata + padding
+
+        except Exception as e:
+            print(f"[warning] Failed to load prompt metadata from {prompt_json}: {e}")
+
+    metadata = []
+
+    for _, row in df.iterrows():
+        prompt = row["prompt"] if "prompt" in df.columns and pd.notna(row["prompt"]) else None
+
+        sentence = ""
+        for candidate in ["sentence", "text", "content", "input", "prompt"]:
+            if candidate in df.columns and pd.notna(row[candidate]):
+                sentence = row[candidate]
+                break
+
+        identity = row["identity"] if "identity" in df.columns and pd.notna(row["identity"]) else None
+        attr = row["attr"] if "attr" in df.columns and pd.notna(row["attr"]) else None
+        attr_type = (
+            normalize_attr_type(row["attr_type"])
+            if "attr_type" in df.columns and pd.notna(row["attr_type"])
+            else None
+        )
+        decode_prefix = (
+            row["decode_prefix"]
+            if "decode_prefix" in df.columns and pd.notna(row["decode_prefix"])
+            else None
+        )
+
+        if (not identity or not attr) and prompt:
+            identity, attr = extract_identity_attr_from_prompt(prompt)
+
+        if not attr_type:
+            attr_type = infer_attr_type(attr, sentence)
+
+        metadata.append(
+            {
+                "prompt": prompt,
+                "identity": identity,
+                "attr": attr,
+                "attr_type": attr_type,
+                "sentence": sentence,
+                "decode_prefix": decode_prefix,
+            }
+        )
+
+    return metadata
+
+
+def build_prefix_from_meta(meta: Optional[Dict[str, Any]], fallback_prefix: str) -> str:
+    meta = meta or {}
+
+    explicit_prefix = meta.get("decode_prefix")
+
+    if explicit_prefix is not None and str(explicit_prefix).strip():
+        return str(explicit_prefix).strip()
+
+    return build_prefix(
+        identity=meta.get("identity"),
+        attr=meta.get("attr"),
+        attr_type=meta.get("attr_type"),
+        fallback_prefix=fallback_prefix,
+    )
+
 
 class ZtoGTR(nn.Module):
     def __init__(self, in_dim, out_dim=512):
         super().__init__()
-
         self.net = nn.Sequential(
             nn.Linear(in_dim, 512),
             nn.ReLU(),
@@ -236,10 +561,6 @@ class ZtoGTR(nn.Module):
     def forward(self, z):
         return self.net(z)
 
-
-# ==============================
-# Inversion model
-# ==============================
 
 class SimpleInversionModel(nn.Module):
     def __init__(
@@ -269,10 +590,7 @@ class SimpleInversionModel(nn.Module):
         )
 
         if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = (
-                self.tokenizer.eos_token
-                or self.tokenizer.unk_token
-            )
+            self.tokenizer.pad_token = self.tokenizer.eos_token or self.tokenizer.unk_token
 
         self.t5 = T5ForConditionalGeneration.from_pretrained(
             t5_path,
@@ -297,14 +615,8 @@ class SimpleInversionModel(nn.Module):
 
     def _enc_out_from_z(self, z: torch.Tensor) -> BaseModelOutput:
         batch_size = z.size(0)
-
         hidden = self.proj(z)
-        hidden = hidden.view(
-            batch_size,
-            self.num_repeat,
-            self.d_model
-        )
-
+        hidden = hidden.view(batch_size, self.num_repeat, self.d_model)
         return BaseModelOutput(last_hidden_state=hidden)
 
     @torch.no_grad()
@@ -322,7 +634,6 @@ class SimpleInversionModel(nn.Module):
                 self.decode_prefix,
                 return_tensors="pt"
             ).input_ids.to(z.device)
-
             prefix_ids = prefix_ids.repeat(z.size(0), 1)
         else:
             prefix_ids = decoder_input_ids
@@ -361,13 +672,8 @@ class SimpleInversionModel(nn.Module):
         return output
 
 
-# ==============================
-# Stage 1: z -> T5 encoder embedding
-# ==============================
-
 def pretrain_z2enc(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     set_seed(args.seed)
 
     Z = torch.load(args.z_train)
@@ -378,17 +684,12 @@ def pretrain_z2enc(args):
     Z = Z.float().to(device)
 
     df = pd.read_csv(args.labels_csv)
-
-    text_col = None
-    for candidate in ["text", "sentence", "content", "prompt", "input"]:
-        if candidate in df.columns:
-            text_col = candidate
-            break
+    text_col = resolve_text_col(df)
 
     if text_col is None:
         raise ValueError(
-            "Stage-1 projection pretraining requires a text column "
-            "such as text, sentence, content, prompt, or input."
+            "Stage-1 projection pretraining requires a text column, "
+            "such as sentence, text, content, input, or prompt."
         )
 
     texts = df[text_col].astype(str).tolist()
@@ -404,7 +705,7 @@ def pretrain_z2enc(args):
     ).to(device).eval()
 
     with torch.no_grad():
-        all_targets = []
+        target_embeddings_list = []
         batch_size = 64
 
         for i in range(0, len(texts), batch_size):
@@ -431,9 +732,9 @@ def pretrain_z2enc(args):
                 / attention_mask.sum(dim=1).clamp(min=1)
             )
 
-            all_targets.append(mean_pooled)
+            target_embeddings_list.append(mean_pooled)
 
-        target_embeddings = torch.cat(all_targets, dim=0)
+        target_embeddings = torch.cat(target_embeddings_list, dim=0)
 
     proj = ZtoGTR(
         in_dim=Z.shape[1],
@@ -467,7 +768,6 @@ def pretrain_z2enc(args):
             ).mean()
 
             mse_loss = F.mse_loss(pred_batch, target_batch)
-
             loss = cos_loss + mse_loss * 0.3
 
             optimizer.zero_grad()
@@ -490,19 +790,8 @@ def pretrain_z2enc(args):
     print("Saved pre-trained projection to", save_path)
 
 
-# ==============================
-# Stage 1b: MLE warm-start
-# ==============================
-
 def pretrain_mle(args):
-    """
-    Stage 1b: MLE warm-start with paired (z, text) samples.
-
-    By default, only the projection layer is trained. With --train_t5_mle,
-    the T5 decoder can also be lightly fine-tuned.
-    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     set_seed(args.seed)
     ensure_dir(args.out_dir)
 
@@ -519,19 +808,16 @@ def pretrain_mle(args):
         f"labels_csv has {len(df)} rows, but z has {Z.shape[0]} rows."
     )
 
-    text_col = None
-    for candidate in ["text", "sentence", "content", "prompt", "input"]:
-        if candidate in df.columns:
-            text_col = candidate
-            break
+    text_col = resolve_text_col(df)
 
     if text_col is None:
         raise ValueError(
-            "MLE warm-start requires a text column such as text, sentence, "
-            "content, prompt, or input."
+            "MLE warm-start requires a text column, such as sentence, text, "
+            "content, input, or prompt."
         )
 
     texts = df[text_col].astype(str).tolist()
+    prefix_meta = load_prefix_metadata_from_dataframe_or_prompt(df, args.prompt_json)
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name,
@@ -566,7 +852,7 @@ def pretrain_mle(args):
         model.proj.load_state_dict(state_dict, strict=False)
 
     if args.train_t5_mle:
-        params = [p for p in model.parameters() if p.requires_grad]
+        params = [param for param in model.parameters() if param.requires_grad]
     else:
         params = list(model.proj.parameters())
 
@@ -584,7 +870,7 @@ def pretrain_mle(args):
             return self.Z.size(0)
 
         def __getitem__(self, index):
-            return self.Z[index], self.texts[index]
+            return self.Z[index], self.texts[index], index
 
     dataset = TextDataset(Z, texts)
 
@@ -595,16 +881,24 @@ def pretrain_mle(args):
     )
 
     for epoch in range(1, args.mle_epochs + 1):
-        for z_batch, text_batch in loader:
+        for z_batch, text_batch, index_batch in loader:
             z_batch = z_batch.to(device).float()
 
-            prefixed_texts = [
-                args.decode_prefix + text
-                for text in text_batch
-            ]
+            target_texts = []
+
+            for text, index in zip(text_batch, index_batch.tolist()):
+                meta_i = prefix_meta[index] if index < len(prefix_meta) else {}
+                prefix_i = build_prefix_from_meta(meta_i, args.decode_prefix)
+                target_texts.append(
+                    compose_target_text(
+                        prefix_i,
+                        text,
+                        args.decode_prefix
+                    )
+                )
 
             label_tokens = tokenizer(
-                prefixed_texts,
+                target_texts,
                 padding=True,
                 truncation=True,
                 max_length=128,
@@ -636,15 +930,9 @@ def pretrain_mle(args):
     print("Saved MLE-tuned projection to", save_path)
 
 
-# ==============================
-# Stage 2: RL training
-# ==============================
-
 def train_label_only(args):
     set_seed(args.seed)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     ensure_dir(args.out_dir)
 
     Z = torch.load(args.z_train)
@@ -702,7 +990,6 @@ def train_label_only(args):
 
     if not all(label in label_map for label in raw_labels):
         missing = sorted(set(raw_labels) - set(label_map.keys()))
-
         raise ValueError(
             f"Some labels are not included in label_map: {missing[:10]}"
         )
@@ -718,10 +1005,7 @@ def train_label_only(args):
     )
 
     if tokenizer_train.pad_token is None:
-        tokenizer_train.pad_token = (
-            tokenizer_train.eos_token
-            or tokenizer_train.unk_token
-        )
+        tokenizer_train.pad_token = tokenizer_train.eos_token or tokenizer_train.unk_token
 
     pad_id = tokenizer_train.pad_token_id
     eos_id = tokenizer_train.eos_token_id or pad_id
@@ -745,12 +1029,10 @@ def train_label_only(args):
         print("[info] Loading z2enc_mle.pt.")
         state_dict = torch.load(mle_path, map_location="cpu")
         model.proj.load_state_dict(state_dict, strict=False)
-
     elif os.path.exists(pretrain_path):
         print("[info] Loading pre-trained z2enc.pt.")
         state_dict = torch.load(pretrain_path, map_location="cpu")
         model.proj.load_state_dict(state_dict, strict=False)
-
     else:
         print(
             "[warning] No z2enc*.pt found. "
@@ -758,19 +1040,15 @@ def train_label_only(args):
         )
 
     optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
+        [param for param in model.parameters() if param.requires_grad],
         lr=args.rl_lr
     )
 
-    text_col = None
-    for candidate in ["text", "sentence", "content", "prompt", "input"]:
-        if candidate in df.columns:
-            text_col = candidate
-            break
+    text_col = resolve_text_col(df)
+    prefix_meta = load_prefix_metadata_from_dataframe_or_prompt(df, args.prompt_json)
 
     if text_col is not None:
         print("[info] Encoding instance-level target texts for semantic reward.")
-
         instance_texts = df[text_col].astype(str).tolist()
 
         with torch.no_grad():
@@ -778,7 +1056,6 @@ def train_label_only(args):
                 instance_texts,
                 batch_size=128
             )
-
     else:
         instance_targets = None
         print("[info] No text column found. Instance-level semantic reward is disabled.")
@@ -802,7 +1079,6 @@ def train_label_only(args):
 
     reward_ma = None
     beta = args.reward_ma_beta
-
     recent_texts = deque(maxlen=args.recent_capacity)
     recent_heads = deque(maxlen=args.recent_capacity)
 
@@ -816,6 +1092,22 @@ def train_label_only(args):
             y_batch = y_batch.to(device)
             index_batch = index_batch.to(device)
 
+            prefix_texts = [
+                build_prefix_from_meta(
+                    prefix_meta[index.item()] if index.item() < len(prefix_meta) else {},
+                    args.decode_prefix
+                )
+                for index in index_batch
+            ]
+
+            decoder_input_ids = tokenizer_train(
+                prefix_texts,
+                padding=True,
+                truncation=True,
+                max_length=64,
+                return_tensors="pt"
+            ).input_ids.to(device)
+
             with torch.no_grad():
                 generated_ids = model.generate(
                     inputs={"frozen_embeddings": embeddings},
@@ -826,7 +1118,8 @@ def train_label_only(args):
                         "top_k": args.top_k,
                         "temperature": args.temperature,
                         "repetition_penalty": args.train_repetition_penalty,
-                    }
+                    },
+                    decoder_input_ids=decoder_input_ids,
                 )
 
                 texts = model.tokenizer.batch_decode(
@@ -964,7 +1257,6 @@ def train_label_only(args):
                     ) * 10
 
                     max_sim, _ = sim_mat.max(dim=-1)
-
                     r_div = -max_sim
                     reward = reward + args.w_div * r_div
 
@@ -985,7 +1277,6 @@ def train_label_only(args):
 
             logits2 = output.logits
             target = generated_ids[:, 1:].contiguous()
-
             log_probs2 = F.log_softmax(logits2, dim=-1)
 
             target_log_probs = log_probs2.gather(
@@ -1070,24 +1361,8 @@ def train_label_only(args):
         print(f"Saved checkpoint to {save_dir}")
 
 
-# ==============================
-# Inference
-# ==============================
-
 @torch.no_grad()
 def inference(args):
-    """
-    Generate text with K candidates per z and rerank by classifier score
-    and semantic consistency.
-
-    The output CSV preserves row alignment:
-        output row i corresponds to Z[i] and labels_csv row i.
-
-    Optional prompt-constrained inference:
-        If --prompt_json and --prompt_n_supervised are provided, the first N
-        samples use identity and attribute parsed from prompt_json as decoder
-        prefixes.
-    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -1112,7 +1387,6 @@ def inference(args):
     )
 
     z_dim = proj_state_dict["weight"].shape[1]
-
     t5_dir = os.path.join(args.load_from, "t5")
 
     model = SimpleInversionModel(
@@ -1189,51 +1463,7 @@ def inference(args):
         if not isinstance(raw_prompts, list):
             raise ValueError("prompt_json must be a list.")
 
-        def extract_identity_attr(prompt_text: str):
-            """
-            Extract the first two {...} spans from a prompt.
-
-            The first span is treated as identity and the second span as
-            attribute. Later empty braces are ignored.
-            """
-            spans = []
-            current = []
-            inside = False
-
-            for ch in prompt_text:
-                if ch == "{":
-                    inside = True
-                    current = []
-                elif ch == "}":
-                    if inside:
-                        spans.append("".join(current).strip())
-                        inside = False
-                else:
-                    if inside:
-                        current.append(ch)
-
-            identity = spans[0] if len(spans) >= 1 else None
-            attribute = spans[1] if len(spans) >= 2 else None
-
-            return identity, attribute
-
-        prompt_meta = []
-
-        for item in raw_prompts:
-            if isinstance(item, dict) and "prompt" in item:
-                prompt_text = item["prompt"]
-            else:
-                prompt_text = str(item)
-
-            identity, attribute = extract_identity_attr(prompt_text)
-
-            prompt_meta.append(
-                {
-                    "prompt": prompt_text,
-                    "identity": identity,
-                    "attr": attribute,
-                }
-            )
+        prompt_meta = load_prompt_metadata_from_list(raw_prompts)
 
         if len(prompt_meta) < args.prompt_n_supervised:
             print(
@@ -1252,7 +1482,6 @@ def inference(args):
 
     for i in range(0, Z.shape[0], batch_size):
         embeddings = Z[i:i + batch_size].to(device).float()
-
         current_batch_size = embeddings.size(0)
 
         y_batch = torch.tensor(
@@ -1275,17 +1504,10 @@ def inference(args):
                     global_index < args.prompt_n_supervised
                     and global_index < len(prompt_meta)
                 ):
-                    meta_j = prompt_meta[global_index]
-
-                    identity = meta_j.get("identity")
-                    attribute = meta_j.get("attr")
-
-                    if identity and attribute:
-                        prefix = f"{identity} who is {{{attribute}}}"
-                    elif attribute:
-                        prefix = f"{{{attribute}}}"
-                    else:
-                        prefix = decode_prefix
+                    prefix = build_prefix_from_meta(
+                        prompt_meta[global_index],
+                        decode_prefix
+                    )
                 else:
                     prefix = decode_prefix
 
@@ -1374,7 +1596,18 @@ def inference(args):
         }
     )
 
-    for col in ["id", "text", "sentence", "content", "prompt", "input"]:
+    for col in [
+        "id",
+        "text",
+        "sentence",
+        "content",
+        "prompt",
+        "input",
+        "identity",
+        "attr",
+        "attr_type",
+        "decode_prefix",
+    ]:
         if col in df_labels.columns:
             output_df[col] = (
                 df_labels[col]
@@ -1390,10 +1623,6 @@ def inference(args):
 
     print("Wrote", len(generations), "rows to", args.infer_out)
 
-
-# ==============================
-# Evaluation
-# ==============================
 
 @torch.no_grad()
 def evaluate(args):
@@ -1444,22 +1673,14 @@ def evaluate(args):
     print(f"[Eval] Accuracy on generated texts: {acc:.4f}")
 
 
-# ==============================
-# Arguments
-# ==============================
-
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    # Data.
     parser.add_argument("--z_train", type=str)
     parser.add_argument("--labels_csv", type=str)
     parser.add_argument("--label_col", type=str, default="label")
-
-    # Classifier.
     parser.add_argument("--clf_ckpt", type=str)
 
-    # Base model.
     parser.add_argument(
         "--model_name",
         type=str,
@@ -1478,7 +1699,6 @@ def parse_args():
         default=24
     )
 
-    # RL.
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--rl_lr", type=float, default=1e-5)
@@ -1501,22 +1721,16 @@ def parse_args():
     parser.add_argument("--w_div", type=float, default=0.0)
     parser.add_argument("--w_ngram", type=float, default=0.0)
     parser.add_argument("--recent_capacity", type=int, default=128)
-
-    # Projection.
     parser.add_argument("--use_proj_semantic", action="store_true")
     parser.add_argument("--proj_lr", type=float, default=5e-4)
-
-    # Encoder model for reward.
     parser.add_argument("--gtr_path", type=str, default=None)
 
-    # Directories.
     parser.add_argument(
         "--out_dir",
         type=str,
         default="saves/zspec_label_only"
     )
 
-    # Inference.
     parser.add_argument("--load_from", type=str)
     parser.add_argument("--z_test", type=str)
 
@@ -1534,7 +1748,6 @@ def parse_args():
     parser.add_argument("--infer_rerank_alpha", type=float, default=1.0)
     parser.add_argument("--infer_rerank_beta", type=float, default=0.4)
 
-    # Prompt-constrained inference.
     parser.add_argument(
         "--prompt_json",
         type=str,
@@ -1555,22 +1768,16 @@ def parse_args():
         )
     )
 
-    # Evaluation.
     parser.add_argument("--evaluate", action="store_true")
     parser.add_argument("--gen_csv", type=str)
-
-    # Stage 1.
     parser.add_argument("--pretrain_z2enc", action="store_true")
     parser.add_argument("--pretrain_epochs", type=int, default=10)
-
-    # Stage 1b.
     parser.add_argument("--pretrain_mle", action="store_true")
     parser.add_argument("--mle_epochs", type=int, default=2)
     parser.add_argument("--mle_lr", type=float, default=5e-5)
     parser.add_argument("--mle_batch_size", type=int, default=16)
     parser.add_argument("--train_t5_mle", action="store_true")
 
-    # Misc.
     parser.add_argument(
         "--train_t5",
         action="store_true",
@@ -1581,10 +1788,6 @@ def parse_args():
 
     return parser.parse_args()
 
-
-# ==============================
-# Entry
-# ==============================
 
 def main():
     args = parse_args()
