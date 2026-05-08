@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Train a lightweight TextSpaceClassifier on T5 encoder sentence embeddings.
-
-Main functions:
-- Encode input texts with a T5 encoder using mean pooling
-- Train a classifier in the embedding space
-- Support multi-class labels, e.g., labels in {0, 1, 2}
-- Save the trained classifier and label mapping
-"""
-
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -27,11 +14,6 @@ import torch.nn.functional as F
 from sklearn.utils.class_weight import compute_class_weight
 
 from transformers import AutoTokenizer, T5EncoderModel, AutoModel
-
-
-# -----------------
-# Utilities
-# -----------------
 
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -98,14 +80,7 @@ def build_label_mapping(
     num_labels: Optional[int] = None,
     enforce_numeric: bool = True,
 ) -> Tuple[Dict[str, int], List[int]]:
-    """
-    Build a label mapping.
 
-    If num_labels is provided and enforce_numeric=True, labels are expected
-    to be numeric strings in the range {0, ..., num_labels - 1}.
-
-    Otherwise, labels are automatically mapped to consecutive integer IDs.
-    """
     raw_labels = [(y or "").strip() for y in raw_labels]
 
     if num_labels is not None:
@@ -168,19 +143,7 @@ def t5_embed_texts(
     batch_size: int = 128,
     max_length: int = 128
 ) -> torch.Tensor:
-    """
-    Encode texts with a T5 encoder and return mean-pooled embeddings.
 
-    Args:
-        texts: Input text list.
-        t5_path: Local path to the T5 model.
-        device: Computation device.
-        batch_size: Batch size for encoding.
-        max_length: Maximum token length.
-
-    Returns:
-        A tensor of shape [B, H], where H is the encoder hidden size.
-    """
     tokenizer = AutoTokenizer.from_pretrained(
         t5_path,
         local_files_only=True
@@ -399,11 +362,11 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device={device}, t5_path={args.t5_path}")
 
-    # 1. Load data.
+
     texts, raw_labels = load_texts_and_labels(args.train_csv)
     print(f"Loaded {len(texts)} rows from {args.train_csv}")
 
-    # 2. Build label mapping.
+
     label_map, y_list = build_label_mapping(
         raw_labels,
         num_labels=args.num_labels,
@@ -413,7 +376,7 @@ def main():
     num_labels = args.num_labels
     y = torch.tensor(y_list, dtype=torch.long)
 
-    # 3. Save label mapping.
+
     base, _ = os.path.splitext(args.save_path)
 
     with open(base + "_label_map.json", "w", encoding="utf-8") as f:
@@ -429,7 +392,7 @@ def main():
         {i: int(label_counts[i]) for i in range(num_labels)}
     )
 
-    # 4. Encode texts into embeddings.
+
     X = t5_embed_texts(
         texts,
         t5_path=args.t5_path,
@@ -442,7 +405,7 @@ def main():
         f"Embedding shape mismatch: {X.shape}"
     )
 
-    # 5. Split train and validation sets.
+
     N = X.shape[0]
     indices = np.arange(N)
     np.random.shuffle(indices)
@@ -457,7 +420,7 @@ def main():
     X_val = X[val_idx]
     y_val = y[val_idx]
 
-    # 6. Build class weights if required.
+
     class_weights = None
 
     if args.use_class_weights:
@@ -483,7 +446,7 @@ def main():
 
         print("Class weights:", class_weights.detach().cpu().numpy().tolist())
 
-    # 7. Build model and optimizer.
+
     model = TextSpaceClassifier(
         in_dim=512,
         hidden=256,
@@ -496,7 +459,7 @@ def main():
         lr=args.lr
     )
 
-    # 8. Build data loaders.
+
     train_loader = make_loader(
         X_train,
         y_train,
@@ -511,7 +474,7 @@ def main():
         shuffle=False
     )
 
-    # 9. Train classifier.
+
     best_val_acc = 0.0
     best_state = None
 
@@ -543,7 +506,7 @@ def main():
                 for k, v in model.state_dict().items()
             }
 
-    # 10. Save classifier.
+
     payload = {
         "state_dict": (
             best_state

@@ -4,13 +4,7 @@ from transformers import AutoTokenizer, T5EncoderModel
 
 
 def load_data(csv_path):
-    """
-    Load texts and labels from a CSV file.
 
-    The CSV file is expected to contain two columns:
-      - text: input text
-      - label: integer class label
-    """
     df = pd.read_csv(csv_path)
     df = df.dropna(subset=["text", "label"])
 
@@ -21,18 +15,7 @@ def load_data(csv_path):
 
 
 def get_gtr_token_embeddings(texts, model_path, device="cuda"):
-    """
-    Obtain mean-pooled text embeddings using a T5 encoder.
 
-    Args:
-        texts: A list of input texts.
-        model_path: Local model path or Hugging Face model name.
-        device: Device used for inference, e.g., "cuda" or "cpu".
-
-    Returns:
-        A tensor of shape [B, H], where B is the number of texts and
-        H is the hidden size of the encoder.
-    """
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model = T5EncoderModel.from_pretrained(model_path).to(device)
     model.eval()

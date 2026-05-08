@@ -1,17 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Train a representation decomposition model.
-
-Main functions:
-- Train the encoder, classifier, adversarial classifier, and decoder
-- Extract z_specific and z_shared representations
-- Save model checkpoints and vector outputs
-- Evaluate:
-  (1) z_specific -> label accuracy
-  (2) z_shared -> label accuracy using the adversarial head
-"""
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -31,10 +17,6 @@ from utils import load_data, get_gtr_token_embeddings
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import accuracy_score
 
-
-# ==============================
-# Helper functions
-# ==============================
 
 @torch.no_grad()
 def extract_z_specific(encoder, dataloader, device):
@@ -123,10 +105,6 @@ def set_seed(seed=42):
 
 
 def compute_aligned_class_weights(train_labels, num_classes, device):
-    """
-    Return class weights aligned to class indices 0, 1, ..., num_classes - 1.
-    If a class is missing in the training set, its weight is set to 1.0.
-    """
     labels = np.asarray(train_labels, dtype=np.int64)
     present = np.unique(labels)
 
@@ -147,13 +125,6 @@ def compute_aligned_class_weights(train_labels, num_classes, device):
 
 
 def save_per_class_z_and_dirs(z_specific, labels, out_dir, num_classes=3, eps=1e-8):
-    """
-    Save per-class z_specific representations and normalized class directions.
-
-    Saved files:
-      - z_specific_train_class{c}.pt
-      - dir_specific_class{c}.pt
-    """
     os.makedirs(out_dir, exist_ok=True)
 
     labels = np.asarray(labels, dtype=np.int64)
@@ -244,9 +215,6 @@ def parse_args():
     return parser.parse_args()
 
 
-# ==============================
-# Main
-# ==============================
 
 def main():
     args = parse_args()
@@ -259,9 +227,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # ==============================
-    # Train data
-    # ==============================
 
     train_texts, train_labels = load_data(args.train_file)
 
@@ -295,9 +260,6 @@ def main():
 
     print("class_weights =", class_weights.detach().cpu().numpy().tolist())
 
-    # ==============================
-    # Model
-    # ==============================
 
     encoder = Encoder(
         token_dim=args.token_dim,
@@ -331,9 +293,6 @@ def main():
         lr=args.lr_adv
     )
 
-    # ==============================
-    # Train
-    # ==============================
 
     train_model(
         encoder=encoder,
@@ -362,9 +321,6 @@ def main():
         name="Train Set"
     )
 
-    # ==============================
-    # Save checkpoints
-    # ==============================
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
@@ -374,9 +330,6 @@ def main():
 
     print(f"Model weights saved to {args.checkpoint_dir}/")
 
-    # ==============================
-    # Test data
-    # ==============================
 
     test_texts, test_labels = load_data(args.test_file)
 
@@ -403,9 +356,6 @@ def main():
         name="Test Set"
     )
 
-    # ==============================
-    # Extract and save test vectors
-    # ==============================
 
     os.makedirs(args.vector_dir, exist_ok=True)
 
@@ -426,9 +376,6 @@ def main():
 
     print("Saved z_specific_test.pt and z_shared_test.pt")
 
-    # ==============================
-    # Extract and save train vectors
-    # ==============================
 
     z_specific_train = extract_z_specific(
         encoder,
@@ -447,9 +394,6 @@ def main():
 
     print("Saved z_specific_train.pt and z_shared_train.pt")
 
-    # ==============================
-    # Save per-class z_specific and directions
-    # ==============================
 
     save_per_class_z_and_dirs(
         z_specific=z_specific_train,
@@ -458,9 +402,6 @@ def main():
         num_classes=args.num_classes
     )
 
-    # ==============================
-    # Adversarial head evaluation
-    # ==============================
 
     print("=" * 60)
     print("Adversarial head evaluation: z_shared -> label. Lower is better.")
