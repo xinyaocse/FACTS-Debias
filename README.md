@@ -51,9 +51,7 @@ After downloading or constructing the data, the datasets should be organized as 
     |-- Assess_Gender_Bias
 ```
 
-The Assess_Gender_Bias directory contains the test set used for gender-bias and factual-preservation evaluation. 
-
-You will find the original public dataset here: [GenderCARE](https://github.com/kstanghere/GenderCARE-ccs24/tree/main).
+The `female`, `male`, and `other` directories only include mini datasets for format demonstration. They are not the full datasets used in the paper experiments. The `Assess_Gender_Bias` directory contains the test set used for gender-bias evaluation. You can find the original public dataset here: [GenderCARE](https://github.com/kstanghere/GenderCARE-ccs24/tree/main).
 
 ## Running the Experiments
 
