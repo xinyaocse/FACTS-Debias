@@ -28,11 +28,11 @@ An example directory structure is shown below:
 ```
 |-- Models
     |-- flan-t5-small
-    |-- Llama-2-7b-chat-hf
-    |-- Llama-2-13b-chat-hf
+    |-- Llama-2-7b
+    |-- Llama-2-13b
     |-- Alpaca-7B
     |-- Orca-7B
-    |-- Platypus-7B
+    |-- Platypus2-7B
 ```
 
 If you run experiments in an offline environment, please make sure that all Hugging Face models, tokenizers, and datasets are available locally before running the scripts.
