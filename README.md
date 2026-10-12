@@ -51,7 +51,7 @@ After downloading or constructing the data, the datasets should be organized as 
     |-- Assess_Gender_Bias
 ```
 
-The `female`, `male`, and `other` directories only include mini datasets for format demonstration. They are not the full datasets used in the paper experiments. The `Assess_Gender_Bias` directory contains the test set used for gender-bias evaluation. You can find the original public dataset here: [GenderCARE](https://github.com/kstanghere/GenderCARE-ccs24/tree/main).
+The `female`, `male`, and `other` directories only include mini datasets for format demonstration. They are not the full datasets used in the paper experiments. The `Assess_Gender_Bias` directory contains the test set used for gender-bias evaluation. You can find the original public dataset here: [GenderCARE](https://github.com/kstanghere/GenderCARE-ccs24/tree/main). Our work builds on the GenderCARE dataset, released through the official GenderCARE repository under the MIT License. We acknowledge the original authors and retain the applicable copyright and license notices for reused materials. Our constructed anti-bias supervision corpus is derived from the corresponding GenderCARE training data, while factual-anchor texts are generated separately.
 
 ## Running the Experiments
 
