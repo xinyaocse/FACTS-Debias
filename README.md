@@ -1,5 +1,5 @@
-# **FACTS-Debias**
-Fact-Anchored Anti-Bias Supervision for Fact-Preserving LLM Debiasing
+# FACTS-Debias
+Fact-Anchored Supervision for Preserving Factual Distinctions in LLM Debiasing
 
 ## Environment Setup
 
@@ -131,3 +131,7 @@ python evaluate_BPR.py \
   --group_type <GROUP_TYPE> \
   --model_type <MODEL_TYPE>
 ```
+
+## Third-Party License
+
+The GenderCARE data reused in this repository and materials derived from it are subject to the original MIT License, copyright (c) 2024 Kstang. The original copyright and permission notice are preserved in [LICENSE-GenderCARE](LICENSE-GenderCARE). See the [upstream license](https://github.com/kstanghere/GenderCARE-ccs24/blob/main/LICENSE). This notice applies to the reused GenderCARE materials and does not declare a license for the FACTS-Debias project as a whole.
