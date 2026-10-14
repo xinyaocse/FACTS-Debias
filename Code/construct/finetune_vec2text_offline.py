@@ -866,18 +866,7 @@ def pretrain_mle(args):
         for z_batch, text_batch, index_batch in loader:
             z_batch = z_batch.to(device).float()
 
-            target_texts = []
-
-            for text, index in zip(text_batch, index_batch.tolist()):
-                meta_i = prefix_meta[index] if index < len(prefix_meta) else {}
-                prefix_i = build_prefix_from_meta(meta_i, args.decode_prefix)
-                target_texts.append(
-                    compose_target_text(
-                        prefix_i,
-                        text,
-                        args.decode_prefix
-                    )
-                )
+            target_texts = list(text_batch)
 
             label_tokens = tokenizer(
                 target_texts,
