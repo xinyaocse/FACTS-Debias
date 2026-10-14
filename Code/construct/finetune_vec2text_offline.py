@@ -8,7 +8,6 @@ import random
 import re
 import numpy as np
 import pandas as pd
-from collections import deque
 from typing import Optional, List, Dict, Any
 
 import torch
@@ -175,21 +174,6 @@ class GTRWrapper:
             return torch.cat(outputs, dim=0)
 
         return torch.empty(0, 512, device=self.device)
-
-
-def is_cjk_ratio(text: str) -> float:
-    total = len(text)
-    cjk = 0
-
-    for ch in text:
-        if (
-            "\u4e00" <= ch <= "\u9fff"
-            or "\u3040" <= ch <= "\u30ff"
-            or "\uac00" <= ch <= "\ud7af"
-        ):
-            cjk += 1
-
-    return cjk / max(1, total)
 
 
 def resolve_text_col(df: pd.DataFrame) -> Optional[str]:
@@ -927,436 +911,152 @@ def pretrain_mle(args):
 
     print("Saved MLE-tuned projection to", save_path)
 
+    model.tokenizer.save_pretrained(args.out_dir)
+    model.t5.save_pretrained(os.path.join(args.out_dir, "t5"))
+    torch.save(model.proj.state_dict(), os.path.join(args.out_dir, "proj.pt"))
+    meta = {
+        "num_repeat_tokens": args.num_repeat_tokens,
+        "pad_token_id": int(model.tokenizer.pad_token_id),
+        "eos_token_id": int(model.tokenizer.eos_token_id or model.tokenizer.pad_token_id),
+        "decode_prefix": args.decode_prefix,
+    }
+    with open(os.path.join(args.out_dir, "meta.json"), "w", encoding="utf-8") as stream:
+        json.dump(meta, stream, ensure_ascii=False, indent=2)
 
-def train_label_only(args):
-    set_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ensure_dir(args.out_dir)
 
-    Z = torch.load(args.z_train)
 
-    if not torch.is_tensor(Z):
-        Z = torch.tensor(Z)
+def descriptor_pair_from_meta(meta: Dict[str, Any]):
+    """Read two paired descriptors from CSV/JSON fields or GenderCARE prompts."""
+    identity = meta.get("identity") or meta.get("object")
+    prompt = str(meta.get("prompt") or "")
+    spans = extract_braced_spans(prompt)
+    if not identity and spans:
+        identity = spans[0]
 
-    Z = Z.float()
+    def value(keys):
+        for key in keys:
+            item = meta.get(key)
+            if item is not None and str(item).strip():
+                return str(item).strip()
+        return None
 
-    df = pd.read_csv(args.labels_csv)
+    first = value(["biased_descriptor", "biased_attr", "descriptor_biased"])
+    second = value(["anti_biased_descriptor", "antibiased_descriptor",
+                    "anti_biased_attr", "antibiased_attr", "descriptor_anti_biased"])
+    if first and second:
+        return identity, [first, second]
 
-    assert len(df) == Z.shape[0], (
-        f"labels_csv has {len(df)} rows, but z_specific has {Z.shape[0]} rows."
+    pair = meta.get("descriptors") or meta.get("descriptor_pair")
+    if isinstance(pair, (list, tuple)) and len(pair) == 2:
+        return identity, [str(item).strip() for item in pair]
+    if isinstance(pair, str):
+        try:
+            parsed = json.loads(pair)
+        except (ValueError, TypeError):
+            parsed = [item.strip() for item in pair.split(",")]
+        if isinstance(parsed, list) and len(parsed) == 2:
+            return identity, [str(item).strip() for item in parsed]
+
+    # Attribute-set prompts: {identity} ... {descriptor1, descriptor2}.
+    for span in spans:
+        choices = [item.strip() for item in span.split(",")]
+        if len(choices) == 2 and all(choices):
+            return identity, choices
+
+    # Phrase-pair prompts: (identity, descriptor) or (descriptor, identity).
+    phrase_pairs = re.findall(r"\(([^(),]+),\s*([^(),]+)\)", prompt)
+    if len(phrase_pairs) >= 2:
+        pair1, pair2 = [[item.strip().strip("{}") for item in pair]
+                        for pair in phrase_pairs[:2]]
+        if not identity:
+            common = set(pair1) & set(pair2)
+            if len(common) == 1:
+                identity = common.pop()
+        if identity:
+            for position in (0, 1):
+                if all(pair[position].casefold() == str(identity).casefold()
+                       for pair in (pair1, pair2)):
+                    return identity, [pair1[1 - position], pair2[1 - position]]
+    raise ValueError(
+        "Each generation row needs an identity and two paired descriptors: "
+        "provide biased_descriptor/anti_biased_descriptor, descriptors, "
+        "or a GenderCARE prompt containing both alternatives."
     )
 
-    classifier, label_map, gtr_path_from_ckpt, _ = load_tsc(
-        args.clf_ckpt,
-        device
-    )
 
-    gtr_path = (
-        args.gtr_path
-        if args.gtr_path
-        else (gtr_path_from_ckpt or DEFAULT_GTR_PATH)
-    )
+def load_descriptor_metadata(df, prompt_json=None, prompt_n_supervised=0):
+    metadata = load_prefix_metadata_from_dataframe_or_prompt(df)
+    for meta, (_, row) in zip(metadata, df.iterrows()):
+        meta.update({key: item for key, item in row.items() if pd.notna(item)})
+    if prompt_json:
+        with open(prompt_json, "r", encoding="utf-8") as stream:
+            prompts = json.load(stream)
+        if not isinstance(prompts, list):
+            raise ValueError("prompt_json must be a list.")
+        limit = prompt_n_supervised if prompt_n_supervised > 0 else len(metadata)
+        for index, item in enumerate(prompts[:min(limit, len(metadata))]):
+            if isinstance(item, dict):
+                metadata[index].update(item)
+            else:
+                metadata[index]["prompt"] = str(item)
+    return metadata
 
-    gtr = GTRWrapper(
-        gtr_path=gtr_path,
-        device=device
-    )
 
+def descriptor_token_mask(tokenizer, prefix, descriptor, input_ids):
+    """Locate descriptor tokens, excluding prefix context, EOS and padding."""
+    start = prefix.rfind(descriptor)
+    if start < 0:
+        raise ValueError(f"Descriptor {descriptor!r} is absent from prefix {prefix!r}.")
+    end = start + len(descriptor)
     try:
-        classifier_in_dim = next(classifier.parameters()).shape[1]
-        probe = gtr.encode(["hello"])
-
-        print(
-            f"[debug] classifier input dim={classifier_in_dim}, "
-            f"encoder output dim={probe.shape[-1]}"
-        )
-
-        assert classifier_in_dim == probe.shape[-1], (
-            "The classifier input dimension does not match the encoder output dimension. "
-            "Please check the classifier checkpoint and gtr_path."
-        )
-
-    except Exception as e:
-        print("[warning] Dimension check failed:", e)
-
-    if args.label_col not in df.columns:
-        raise ValueError(
-            f"{args.labels_csv} must contain the column {args.label_col}."
-        )
-
-    raw_labels = df[args.label_col].astype(str).tolist()
-
-    if not all(label in label_map for label in raw_labels):
-        missing = sorted(set(raw_labels) - set(label_map.keys()))
-        raise ValueError(
-            f"Some labels are not included in label_map: {missing[:10]}"
-        )
-
-    y = torch.tensor(
-        [label_map[label] for label in raw_labels],
-        dtype=torch.long
-    )
-
-    tokenizer_train = AutoTokenizer.from_pretrained(
-        args.model_name,
-        local_files_only=True
-    )
-
-    if tokenizer_train.pad_token is None:
-        tokenizer_train.pad_token = tokenizer_train.eos_token or tokenizer_train.unk_token
-
-    pad_id = tokenizer_train.pad_token_id
-    eos_id = tokenizer_train.eos_token_id or pad_id
-
-    model = SimpleInversionModel(
-        t5_path=args.model_name,
-        z_dim=Z.shape[1],
-        num_repeat_tokens=args.num_repeat_tokens,
-        pad_id=pad_id,
-        eos_id=eos_id,
-        device=device,
-        train_t5=args.train_t5,
-        decode_prefix=args.decode_prefix,
-        t5_tokenizer_path=args.model_name,
-    )
-
-    mle_path = os.path.join(args.out_dir, "z2enc_mle.pt")
-    pretrain_path = os.path.join(args.out_dir, "z2enc.pt")
-
-    if os.path.exists(mle_path):
-        print("[info] Loading z2enc_mle.pt.")
-        state_dict = torch.load(mle_path, map_location="cpu")
-        model.proj.load_state_dict(state_dict, strict=False)
-    elif os.path.exists(pretrain_path):
-        print("[info] Loading pre-trained z2enc.pt.")
-        state_dict = torch.load(pretrain_path, map_location="cpu")
-        model.proj.load_state_dict(state_dict, strict=False)
-    else:
-        print(
-            "[warning] No z2enc*.pt found. "
-            "RL training will start from a randomly initialized projection."
-        )
-
-    optimizer = torch.optim.AdamW(
-        [param for param in model.parameters() if param.requires_grad],
-        lr=args.rl_lr
-    )
-
-    text_col = resolve_text_col(df)
-    prefix_meta = load_prefix_metadata_from_dataframe_or_prompt(df, args.prompt_json)
-
-    if text_col is not None:
-        print("[info] Encoding instance-level target texts for semantic reward.")
-        instance_texts = df[text_col].astype(str).tolist()
-
-        with torch.no_grad():
-            instance_targets = gtr.encode(
-                instance_texts,
-                batch_size=128
-            )
-    else:
-        instance_targets = None
-        print("[info] No text column found. Instance-level semantic reward is disabled.")
-
-    indices = torch.arange(
-        Z.shape[0],
-        dtype=torch.long
-    )
-
-    dataset = torch.utils.data.TensorDataset(
-        Z,
-        y,
-        indices
-    )
-
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True
-    )
-
-    reward_ma = None
-    beta = args.reward_ma_beta
-    recent_texts = deque(maxlen=args.recent_capacity)
-    recent_heads = deque(maxlen=args.recent_capacity)
-
-    for epoch in range(args.epochs):
-        step = 0
-
-        for embeddings, y_batch, index_batch in loader:
-            step += 1
-
-            embeddings = embeddings.to(device).float()
-            y_batch = y_batch.to(device)
-            index_batch = index_batch.to(device)
-
-            prefix_texts = [
-                build_prefix_from_meta(
-                    prefix_meta[index.item()] if index.item() < len(prefix_meta) else {},
-                    args.decode_prefix
-                )
-                for index in index_batch
-            ]
-
-            decoder_input_ids = tokenizer_train(
-                prefix_texts,
-                padding=True,
-                truncation=True,
-                max_length=64,
-                return_tensors="pt"
-            ).input_ids.to(device)
-
-            with torch.no_grad():
-                generated_ids = model.generate(
-                    inputs={"frozen_embeddings": embeddings},
-                    generation_kwargs={
-                        "max_new_tokens": args.gen_max_new_tokens,
-                        "do_sample": True,
-                        "top_p": args.top_p,
-                        "top_k": args.top_k,
-                        "temperature": args.temperature,
-                        "repetition_penalty": args.train_repetition_penalty,
-                    },
-                    decoder_input_ids=decoder_input_ids,
-                )
-
-                texts = model.tokenizer.batch_decode(
-                    generated_ids,
-                    skip_special_tokens=True
-                )
-
-                generated_ids = generated_ids.to(device)
-
-            batch_size = len(texts)
-
-            with torch.no_grad():
-                gtr_embeddings = gtr.encode(texts)
-
-                logits = classifier(gtr_embeddings)
-                log_probs = F.log_softmax(logits, dim=-1)
-
-                r_cls = log_probs[
-                    torch.arange(y_batch.size(0), device=device),
-                    y_batch
-                ]
-
-                other = log_probs.clone()
-                other[
-                    torch.arange(other.size(0), device=device),
-                    y_batch
-                ] = -1e9
-
-                other_max = other.max(dim=-1).values
-                r_margin = r_cls - other_max
-
-                probs = F.softmax(logits, dim=-1)
-                entropy = -(
-                    probs * torch.log(probs + 1e-8)
-                ).sum(dim=-1)
-
-                r_conf = -entropy
-
-                lengths = (
-                    generated_ids != tokenizer_train.pad_token_id
-                ).sum(dim=-1).float()
-
-                r_len = -(
-                    (lengths - args.len_target) ** 2
-                ) / (2 * (args.len_sigma ** 2))
-
-                reward = (
-                    args.w_cls * r_cls
-                    + args.w_cls_margin * r_margin
-                    + args.w_len * r_len
-                    + 0.05 * r_conf
-                )
-
-                if args.w_lang > 0:
-                    lang_bonus = []
-
-                    for text in texts:
-                        cjk_ratio = is_cjk_ratio(text)
-
-                        if cjk_ratio > 0.3:
-                            lang_bonus.append(0.0)
-                        else:
-                            ascii_count = sum(
-                                1
-                                for ch in text
-                                if 32 <= ord(ch) < 127
-                            )
-                            ratio = ascii_count / max(1, len(text))
-                            lang_bonus.append(ratio - 0.9)
-
-                    lang_bonus = torch.tensor(
-                        lang_bonus,
-                        device=device,
-                        dtype=reward.dtype
-                    )
-
-                    reward = reward + args.w_lang * lang_bonus
-
-                if instance_targets is not None and args.w_inst > 0:
-                    instance_embeddings = instance_targets[index_batch].to(device)
-
-                    r_inst = F.cosine_similarity(
-                        gtr_embeddings,
-                        instance_embeddings,
-                        dim=-1
-                    )
-
-                    reward = reward + args.w_inst * r_inst
-
-                lower_texts = [
-                    text.strip().lower()
-                    for text in texts
-                ]
-
-                for i, text in enumerate(lower_texts):
-                    if lower_texts.count(text) > batch_size * args.collapse_ratio:
-                        reward[i] = reward[i] - args.collapse_penalty
-
-                if args.w_ngram > 0:
-                    heads = [
-                        " ".join(text.split()[:4]).lower()
-                        for text in texts
-                    ]
-
-                    for i, head in enumerate(heads):
-                        if heads.count(head) > 1:
-                            reward[i] = reward[i] - args.w_ngram
-
-                for i, text in enumerate(lower_texts):
-                    if text in recent_texts:
-                        reward[i] = reward[i] - args.collapse_penalty * 0.5
-
-                heads = [
-                    " ".join(text.split()[:4]).lower()
-                    for text in texts
-                ]
-
-                for i, head in enumerate(heads):
-                    if head in recent_heads:
-                        reward[i] = reward[i] - args.collapse_penalty * 0.3
-
-                recent_texts.extend(lower_texts)
-                recent_heads.extend(heads)
-
-                if args.w_div > 0:
-                    sim_mat = F.cosine_similarity(
-                        gtr_embeddings.unsqueeze(1),
-                        gtr_embeddings.unsqueeze(0),
-                        dim=-1
-                    )
-
-                    sim_mat = sim_mat - torch.eye(
-                        batch_size,
-                        device=device
-                    ) * 10
-
-                    max_sim, _ = sim_mat.max(dim=-1)
-                    r_div = -max_sim
-                    reward = reward + args.w_div * r_div
-
-                if reward_ma is None:
-                    reward_ma = reward.mean().item()
-
-                advantage = reward - reward_ma
-                reward_ma = (
-                    beta * reward_ma
-                    + (1 - beta) * reward.mean().item()
-                )
-
-            output = model(
-                frozen_embeddings=embeddings,
-                labels=None,
-                decoder_input_ids=generated_ids[:, :-1]
-            )
-
-            logits2 = output.logits
-            target = generated_ids[:, 1:].contiguous()
-            log_probs2 = F.log_softmax(logits2, dim=-1)
-
-            target_log_probs = log_probs2.gather(
-                dim=-1,
-                index=target.unsqueeze(-1)
-            ).squeeze(-1)
-
-            mask = (
-                target != tokenizer_train.pad_token_id
-            ).float()
-
-            target_log_prob_mean = (
-                (target_log_probs * mask).sum(dim=-1)
-                / mask.sum(dim=-1).clamp(min=1)
-            )
-
-            normalized_advantage = advantage.detach()
-
-            if args.adv_clip:
-                normalized_advantage = normalized_advantage.clamp(
-                    -args.adv_clip,
-                    args.adv_clip
-                )
-
-            normalized_advantage = (
-                (normalized_advantage - normalized_advantage.mean())
-                / (normalized_advantage.std() + 1e-6)
-            )
-
-            rl_loss = -(
-                normalized_advantage * target_log_prob_mean
-            ).mean()
-
-            optimizer.zero_grad()
-            rl_loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                max_norm=1.0
-            )
-
-            optimizer.step()
-
-            if step % 20 == 0:
-                print(
-                    f"[RL] epoch {epoch + 1}/{args.epochs} step {step} | "
-                    f"rl={rl_loss.item():.4f} | "
-                    f"reward={reward.mean().item():.3f} | "
-                    f"cls={r_cls.mean().item():.3f}"
-                )
-
-        save_dir = os.path.join(args.out_dir, f"ep{epoch + 1}")
-
-        ensure_dir(save_dir)
-
-        model.tokenizer.save_pretrained(save_dir)
-        model.t5.save_pretrained(os.path.join(save_dir, "t5"))
-
-        torch.save(
-            model.proj.state_dict(),
-            os.path.join(save_dir, "proj.pt")
-        )
-
-        meta = {
-            "num_repeat_tokens": args.num_repeat_tokens,
-            "pad_token_id": int(model.tokenizer.pad_token_id),
-            "eos_token_id": int(
-                model.tokenizer.eos_token_id
-                or model.tokenizer.pad_token_id
-            ),
-            "decode_prefix": args.decode_prefix,
-        }
-
-        with open(os.path.join(save_dir, "meta.json"), "w", encoding="utf-8") as f:
-            json.dump(
-                meta,
-                f,
-                ensure_ascii=False,
-                indent=2
-            )
-
-        print(f"Saved checkpoint to {save_dir}")
+        encoded = tokenizer(prefix, return_offsets_mapping=True)
+        return [right > start and left < end and right > left
+                for left, right in encoded["offset_mapping"]]
+    except (NotImplementedError, TypeError, ValueError):
+        # Slow tokenizers: find the token boundary shared with preceding context.
+        context_ids = tokenizer(prefix[:start], add_special_tokens=False)["input_ids"]
+        full_ids = tokenizer(prefix, add_special_tokens=False)["input_ids"]
+        boundary = 0
+        for left, right in zip(context_ids, full_ids):
+            if left != right:
+                break
+            boundary += 1
+        special_ids = set(tokenizer.all_special_ids)
+        return [index >= boundary and token not in special_ids
+                for index, token in enumerate(input_ids)]
+
+
+@torch.no_grad()
+def select_descriptor_prefixes(model, embeddings, metadata):
+    """Select by mean descriptor-token log P(descriptor | context, projected z)."""
+    prefixes, masks = [], []
+    for meta in metadata:
+        identity, descriptors = descriptor_pair_from_meta(meta)
+        if not identity or any(not item for item in descriptors):
+            raise ValueError("Identity and both descriptors must be non-empty.")
+        for descriptor in descriptors:
+            prefix = build_prefix(identity, descriptor, meta.get("attr_type"),
+                                  model.decode_prefix)
+            ids = model.tokenizer(prefix)["input_ids"]
+            prefixes.append(prefix)
+            masks.append(descriptor_token_mask(model.tokenizer, prefix, descriptor, ids))
+
+    tokens = model.tokenizer(prefixes, padding=True, return_tensors="pt").to(embeddings.device)
+    labels = tokens.input_ids.masked_fill(tokens.attention_mask == 0, -100)
+    output = model(frozen_embeddings=embeddings.repeat_interleave(2, dim=0), labels=labels)
+    log_probs = F.log_softmax(output.logits, dim=-1)
+    token_log_probs = log_probs.gather(-1, tokens.input_ids.unsqueeze(-1)).squeeze(-1)
+    score_mask = torch.zeros_like(tokens.attention_mask, dtype=torch.bool)
+    for index, mask in enumerate(masks):
+        offset = score_mask.size(1) - len(mask) if model.tokenizer.padding_side == "left" else 0
+        score_mask[index, offset:offset + len(mask)] = torch.tensor(
+            mask, dtype=torch.bool, device=embeddings.device)
+    counts = score_mask.sum(dim=-1)
+    if (counts == 0).any():
+        raise ValueError("A descriptor contains no scoreable tokens.")
+    scores = (token_log_probs * score_mask).sum(dim=-1) / counts
+    choices = scores.view(-1, 2).argmax(dim=-1).tolist()
+    return [prefixes[2 * index + choice] for index, choice in enumerate(choices)]
 
 
 @torch.no_grad()
@@ -1452,27 +1152,14 @@ def inference(args):
     y_raw = df_labels[args.label_col].astype(str).tolist()
     y_true = [label_map[label] for label in y_raw]
 
-    prompt_meta = None
-
-    if args.prompt_json and args.prompt_n_supervised > 0:
-        with open(args.prompt_json, "r", encoding="utf-8") as f:
-            raw_prompts = json.load(f)
-
-        if not isinstance(raw_prompts, list):
-            raise ValueError("prompt_json must be a list.")
-
-        prompt_meta = load_prompt_metadata_from_list(raw_prompts)
-
-        if len(prompt_meta) < args.prompt_n_supervised:
-            print(
-                f"[warning] prompt_json contains only {len(prompt_meta)} items. "
-                f"Prompt constraints will be used only for these samples."
-            )
-        else:
-            print(
-                f"[info] Prompt constraints will be used for the first "
-                f"{args.prompt_n_supervised} samples."
-            )
+    descriptor_metadata = load_descriptor_metadata(
+        df_labels, args.prompt_json, args.prompt_n_supervised
+    )
+    for index, item in enumerate(descriptor_metadata):
+        try:
+            descriptor_pair_from_meta(item)
+        except ValueError as error:
+            raise ValueError(f"Generation row {index}: {error}") from error
 
     batch_size = args.batch_size
     generations = []
@@ -1492,35 +1179,16 @@ def inference(args):
             embeddings
         ).last_hidden_state.mean(dim=1)
 
-        if prompt_meta is not None and args.prompt_n_supervised > 0:
-            prefix_texts = []
-
-            for j in range(current_batch_size):
-                global_index = i + j
-
-                if (
-                    global_index < args.prompt_n_supervised
-                    and global_index < len(prompt_meta)
-                ):
-                    prefix = build_prefix_from_meta(
-                        prompt_meta[global_index],
-                        decode_prefix
-                    )
-                else:
-                    prefix = decode_prefix
-
-                prefix_texts.append(prefix)
-
-            decoder_input_ids = tokenizer(
-                prefix_texts,
-                padding=True,
-                truncation=True,
-                max_length=64,
-                return_tensors="pt"
-            ).input_ids.to(device)
-
-        else:
-            decoder_input_ids = None
+        prefix_texts = select_descriptor_prefixes(
+            model, embeddings, descriptor_metadata[i:i + current_batch_size]
+        )
+        decoder_input_ids = tokenizer(
+            prefix_texts,
+            padding=True,
+            truncation=True,
+            max_length=64,
+            return_tensors="pt"
+        ).input_ids.to(device)
 
         best_texts = [""] * current_batch_size
 
@@ -1697,29 +1365,8 @@ def parse_args():
         default=24
     )
 
-    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--rl_lr", type=float, default=1e-5)
     parser.add_argument("--gen_max_new_tokens", type=int, default=48)
-    parser.add_argument("--top_p", type=float, default=0.8)
-    parser.add_argument("--top_k", type=int, default=40)
-    parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--w_cls", type=float, default=1.6)
-    parser.add_argument("--w_cls_margin", type=float, default=0.6)
-    parser.add_argument("--w_len", type=float, default=0.02)
-    parser.add_argument("--len_target", type=float, default=18.0)
-    parser.add_argument("--len_sigma", type=float, default=8.0)
-    parser.add_argument("--w_lang", type=float, default=0.0)
-    parser.add_argument("--w_inst", type=float, default=0.0)
-    parser.add_argument("--adv_clip", type=float, default=1.0)
-    parser.add_argument("--reward_ma_beta", type=float, default=0.9)
-    parser.add_argument("--train_repetition_penalty", type=float, default=1.15)
-    parser.add_argument("--collapse_ratio", type=float, default=0.05)
-    parser.add_argument("--collapse_penalty", type=float, default=1.0)
-    parser.add_argument("--w_div", type=float, default=0.0)
-    parser.add_argument("--w_ngram", type=float, default=0.0)
-    parser.add_argument("--recent_capacity", type=int, default=128)
-    parser.add_argument("--use_proj_semantic", action="store_true")
     parser.add_argument("--proj_lr", type=float, default=5e-4)
     parser.add_argument("--gtr_path", type=str, default=None)
 
@@ -1776,12 +1423,6 @@ def parse_args():
     parser.add_argument("--mle_batch_size", type=int, default=16)
     parser.add_argument("--train_t5_mle", action="store_true")
 
-    parser.add_argument(
-        "--train_t5",
-        action="store_true",
-        help="Fine-tune T5 during RL training."
-    )
-
     parser.add_argument("--seed", type=int, default=42)
 
     return parser.parse_args()
@@ -1798,16 +1439,6 @@ def main():
         pretrain_mle(args)
         return
 
-    if (
-        args.z_train
-        and args.labels_csv
-        and args.clf_ckpt
-        and not args.load_from
-        and not args.evaluate
-    ):
-        train_label_only(args)
-        return
-
     if args.load_from and args.z_test and not args.evaluate:
         inference(args)
         return
@@ -1818,7 +1449,7 @@ def main():
 
     print(
         "Run one of the following modes: "
-        "--pretrain_z2enc | --pretrain_mle | RL training | inference | --evaluate"
+        "--pretrain_z2enc | --pretrain_mle | inference | --evaluate"
     )
 
 
